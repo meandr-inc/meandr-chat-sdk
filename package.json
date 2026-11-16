@@ -1,0 +1,55 @@
+{
+  "name": "@meandr/chat-sdk",
+  "version": "0.0.1",
+  "description": "Meandr Chat's JavaScript client: the visitor's session, their messages and the streamed answers, and safe Markdown for them.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meandr-inc/meandr-chat-sdk.git"
+  },
+  "keywords": [
+    "meandr",
+    "chat",
+    "mcp"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./markdown": {
+      "types": "./dist/markdown.d.ts",
+      "default": "./dist/markdown.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "unpkg": "./dist/meandr-chat.js",
+  "jsdelivr": "./dist/meandr-chat.js",
+  "files": [
+    "dist"
+  ],
+  "sideEffects": [
+    "./dist/meandr-chat.js"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepack": "npm run check"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "esbuild": "0.28.2",
+    "happy-dom": "21.0.4",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}
