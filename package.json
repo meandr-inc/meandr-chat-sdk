@@ -1,6 +1,6 @@
 {
   "name": "@meandr/chat-sdk",
-  "version": "0.0.1",
+  "version": "0.0.0-development",
   "description": "Meandr Chat's JavaScript client: the visitor's session, their messages and the streamed answers, and safe Markdown for them.",
   "license": "Apache-2.0",
   "repository": {
