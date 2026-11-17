@@ -11,6 +11,7 @@ export interface Call {
   signal?: AbortSignal;
   stream?: boolean;
   progress?: (sent: number) => void; // a file's bytes sent, through XMLHttpRequest
+  keepalive?: boolean; // outlives the page
 }
 
 const LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/;
@@ -101,6 +102,7 @@ export function request(fetchFn: Fetch, base: string, c: Call): Promise<Response
   if (c.bearer) headers.Authorization = "Bearer " + c.bearer;
   // The API never redirects, and an old browser would forward Authorization across origins.
   const init: RequestInit = { method: c.method, headers, credentials: "include", cache: "no-store", redirect: "error" };
+  if (c.keepalive) init.keepalive = true;
   if (c.body !== undefined) init.body = c.type ? (c.body as Blob) : JSON.stringify(c.body);
   if (!c.type) return timed(fetchFn, base + c.path, init, c.signal);
   if (c.progress && typeof XMLHttpRequest == "function") return upload(base + c.path, init, c.progress, c.signal);

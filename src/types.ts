@@ -5,6 +5,8 @@ export interface Conversation {
   id: string;
   createdAt: string;
   updatedAt: string;
+  endedAt: string | null; // when its user ended it; null while they haven't, and from a chat that doesn't say
+  title?: string; // only from listConversations: the start of its first message, "" while it has none
 }
 
 export interface Message {
@@ -60,6 +62,7 @@ export interface ChatState {
   readonly anonymous: boolean | null;
   readonly conversation: Conversation | null;
   readonly messages: readonly Message[];
+  readonly hasOlder: boolean;
   readonly outgoing: string | null;
   readonly answer: Answer | null;
   readonly answering: boolean;
@@ -67,6 +70,7 @@ export interface ChatState {
   readonly stop: Stop | null;
   readonly error: ChatError | null;
   readonly files: FileLimits | null;
+  readonly conversationList: boolean | null;
 }
 
 export type SendResult = { ok: true; message: Message; stop: Stop | null } | { ok: false; error: ChatError };
@@ -74,6 +78,14 @@ export type SendResult = { ok: true; message: Message; stop: Stop | null } | { o
 export type AttachResult = { ok: true; file: ChatFile } | { ok: false; error: ChatError };
 
 export type ReadFileResult = { ok: true; blob: Blob } | { ok: false; error: ChatError };
+
+export type ListConversationsResult = { ok: true; conversations: Conversation[]; hasMore: boolean } | { ok: false; error: ChatError };
+
+export type OpenConversationResult = { ok: true; conversation: Conversation } | { ok: false; error: ChatError };
+
+export type DeleteConversationResult = { ok: true } | { ok: false; error: ChatError };
+
+export type LoadOlderResult = { ok: true; messages: Message[] } | { ok: false; error: ChatError };
 
 export interface SendOptions {
   files?: ReadonlyArray<ChatFile | string>;
@@ -86,6 +98,11 @@ export interface AttachOptions {
 }
 
 export interface ReadFileOptions {
+  signal?: AbortSignal;
+}
+
+export interface ListConversationsOptions {
+  before?: Conversation | string;
   signal?: AbortSignal;
 }
 
@@ -128,7 +145,18 @@ export interface Chat {
   readFile(file: ChatFile | string, options?: ReadFileOptions): Promise<ReadFileResult>;
   /** Has the assistant speak first, as the chat's start instructions say: the page can't supply them. */
   start(): Promise<SendResult>;
+  /** Ends the conversation shown and forgets it at once; before the session opens, the one it opens on. Never rejects. */
+  endConversation(): Promise<void>;
+  /** Ends the conversation shown, as endConversation does: the next message or start begins a new one. */
   newConversation(): void;
+  /** Lists the user's conversations, 20 at a time, most recently active first; before goes on after that one. */
+  listConversations(options?: ListConversationsOptions): Promise<ListConversationsResult>;
+  /** Shows that conversation, its last 20 messages, once read, in place of the current one, which it doesn't end. */
+  openConversation(conversation: Conversation | string): Promise<OpenConversationResult>;
+  /** Deletes that conversation with its messages and files, where the chat lists them; one already gone counts. */
+  deleteConversation(conversation: Conversation | string): Promise<DeleteConversationResult>;
+  /** Adds the 20 messages before the oldest shown, while hasOlder; calls while one runs share it. */
+  loadOlder(): Promise<LoadOlderResult>;
   reopen(options?: ReopenOptions): Promise<ChatState>;
   signOut(): Promise<void>;
   destroy(): void;
