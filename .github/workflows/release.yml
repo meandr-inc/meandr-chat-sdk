@@ -40,12 +40,10 @@ jobs:
           npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
           test "v$(jq -r .version package.json)" = "$GITHUB_REF_NAME"
 
-      # prepack runs the typecheck, the tests and the build. NPM_TOKEN serves the first
-      # release only: once npm trusts this workflow, the secret goes and OIDC signs in.
+      # prepack runs the typecheck, the tests and the build. npm signs in as this
+      # workflow, its trusted publisher, with no token.
       - name: Publish
         run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: GitHub release
         env:

@@ -2,8 +2,8 @@ import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatError, createChat, isChatError } from "../src/index";
 import { claimsOf } from "../src/token";
-import type { ChatOptions, ChatState, SendResult } from "../src/types";
-import { ALICE, BOB, FakeChat, ORIGIN, TOKEN_URL, ev, json, jwt } from "./fake";
+import type { AttachResult, ChatFile, ChatOptions, ChatState, PageContext, ReadFileResult, SendResult } from "../src/types";
+import { ALICE, BOB, FakeChat, ORIGIN, TOKEN_URL, TYPES, ev, json, jwt, xhrOf } from "./fake";
 
 function setup(opts: Partial<ChatOptions> = {}, fake = new FakeChat()) {
   const chat = createChat({ url: ORIGIN, fetch: fake.fetch, ...opts } as ChatOptions);
@@ -24,9 +24,13 @@ function err(r: SendResult) {
 
 const sessionPaths = (fake: FakeChat) => fake.seen.filter((s) => s.path === "/chat/v1/session").map((s) => s.method);
 
+// What every message and start tells by default: the browser's time zone.
+const TZ = { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("opening", () => {
@@ -329,7 +333,18 @@ describe("messages", () => {
     expect(end.answering).toBe(false);
     expect(end.stop).toBe("max_tokens");
     expect(end.conversation).not.toBeNull();
-    expect(fake.requests("POST", "/chat/v1/conversations")[0].body).toEqual({ text: "Where is it?" });
+    expect(fake.requests("POST", "/chat/v1/conversations")[0].body).toEqual({ text: "Where is it?", context: TZ });
+  });
+
+  it("shows tools by their titles, or by their names where the chat gives none", async () => {
+    const fake = new FakeChat();
+    fake.turns.push({ tools: [{ name: "rag_search", status: "started", title: "Search the knowledge base" }, { name: "rag_search", status: "done" }, { name: "bare", status: "started" }] });
+    const { chat, states } = setup({ token: ALICE }, fake);
+    ok(await chat.send("find it"));
+    const during = states.filter((s) => s.answer && s.answer.tools.length === 2).pop();
+    const tools = during?.answer?.tools.map((t) => [t.name, t.status, t.title]);
+    expect(tools).toEqual([["rag_search", "done", "Search the knowledge base"], ["bare", "started", "bare"]]);
+    expect(chat.getState().messages[1].toolTitles).toEqual({ rag_search: "Search the knowledge base", bare: "bare" });
   });
 
   it("keeps the objects of messages that didn't change", async () => {
@@ -1225,7 +1240,7 @@ describe("users who change", () => {
   });
 
   it("takes an empty ext for none, as the chat does, and any other for another user", () => {
-    const who = (t: string) => claimsOf(t)!.who;
+    const who = (t: string) => claimsOf(t)!.who_;
     expect(who(jwt({ sub: "alice", ext: {} }))).toBe(who(ALICE));
     expect(who(jwt({ sub: "alice", ext: null }))).toBe(who(ALICE));
     expect(who(jwt({ sub: "alice", ext: { team: 2 } }))).not.toBe(who(ALICE));
@@ -1402,14 +1417,14 @@ describe("the assistant speaking first", () => {
     expect(fake.requests("POST").map((s) => s.path)).toEqual(["/chat/v1/session", "/chat/v1/start"]);
   });
 
-  it("opens, has the assistant speak, and shows its answer alone, sending nothing of the page's", async () => {
+  it("opens, has the assistant speak, and shows its answer alone, sending only the page's context", async () => {
     const fake = new FakeChat();
     fake.startPrompt = "Greet them.";
     const { chat } = setup({ token: ALICE }, fake);
     expect(ok(await chat.start()).message.text).toBe("Hello");
     expect(chat.getState()).toMatchObject({ status: "ready", answering: false, answer: null, outgoing: null });
     expect(chat.getState().messages.map((m) => [m.role, m.text])).toEqual([["assistant", "Hello"]]);
-    expect(fake.requests("POST", "/chat/v1/start")[0].body).toEqual({ new: true }); // no conversation shown
+    expect(fake.requests("POST", "/chat/v1/start")[0].body).toEqual({ new: true, context: TZ }); // no conversation shown
   });
 
   it("after newConversation speaks in a new conversation, never in the one hidden", async () => {
@@ -1424,7 +1439,7 @@ describe("the assistant speaking first", () => {
       expect(chat.getState().conversation!.id).not.toBe(old.id);
       expect(chat.getState().messages.map((m) => m.text)).toEqual(["Hello"]);
       expect(old.messages.map((m) => m.text)).toEqual(["q", "a"]);
-      expect(fake.requests("POST", "/chat/v1/start")[0].body).toEqual({ new: true });
+      expect(fake.requests("POST", "/chat/v1/start")[0].body).toEqual({ new: true, context: TZ });
     }
   });
 
@@ -1454,5 +1469,549 @@ describe("the assistant speaking first", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(ok(await p).message.text).toBe("Hi there");
     expect(chat.getState()).toMatchObject({ answering: false, answer: null });
+  });
+});
+
+describe("page context", () => {
+  const contexts = (fake: FakeChat) =>
+    fake.seen
+      .filter((s) => s.method === "POST" && /\/chat\/v1\/(start|conversations)/.test(s.path))
+      .map((s) => (s.body as { context?: unknown }).context);
+
+  // fill is a view that brings the context, the time zone under it, to exactly bytes.
+  const fill = (bytes: number) => "x".repeat(bytes - new TextEncoder().encode(JSON.stringify({ ...TZ, view: "" })).length);
+
+  it("tells the browser's time zone with every message and start when the page gives no context", async () => {
+    const fake = new FakeChat();
+    fake.startPrompt = "Greet them.";
+    const { chat } = setup({ token: ALICE }, fake);
+    ok(await chat.start());
+    ok(await chat.send("q"));
+    expect(contexts(fake)).toEqual([TZ, TZ]);
+  });
+
+  it("reads the context option at each message and start, the time zone under what it gives", async () => {
+    const fake = new FakeChat();
+    fake.startPrompt = "Greet them.";
+    let n = 0;
+    const view = { drawer: { open: true, order: "A-1042" } };
+    const { chat } = setup({ token: ALICE, context: () => ({ url: "https://shop.example/orders", title: "Orders " + ++n, view }) }, fake);
+    ok(await chat.send("one"));
+    ok(await chat.start());
+    ok(await chat.send("two"));
+    expect(contexts(fake)).toEqual([1, 2, 3].map((i) => ({ ...TZ, url: "https://shop.example/orders", title: "Orders " + i, view })));
+  });
+
+  it("takes the page's own time zone, or none, and waits for a promise", async () => {
+    const pages: Array<PageContext | undefined> = [{ timezone: "Asia/Tokyo" }, { timezone: undefined, view: "list" }, undefined];
+    const { chat, fake } = setup({ token: ALICE, context: async () => pages.shift() });
+    for (const t of ["a", "b", "c"]) ok(await chat.send(t));
+    expect(contexts(fake)).toEqual([{ timezone: "Asia/Tokyo" }, { view: "list" }, TZ]);
+  });
+
+  it("leaves out a context past the chat's most in UTF-8 bytes, keeping the time zone, and warns once naming it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = new FakeChat();
+    fake.contextMax = 200;
+    fake.startPrompt = "Greet them.";
+    const views = [fill(200), fill(201), "é".repeat(90), fill(300)];
+    const { chat } = setup({ token: ALICE, context: () => ({ view: views.shift() }) }, fake);
+    ok(await chat.send("fits"));
+    ok(await chat.send("a byte over"));
+    ok(await chat.send("short, in two-byte characters"));
+    ok(await chat.start());
+    expect(contexts(fake)).toEqual([{ ...TZ, view: fill(200) }, TZ, TZ, TZ]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("200 bytes");
+  });
+
+  it("leaves out a context whose url, title or timezone the chat would refuse, and warns", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const pages: unknown[] = [
+      { url: "https://shop.example/?q=" + "q".repeat(2048) },
+      { title: 42 },
+      { timezone: "Z".repeat(65) },
+      { url: "https://shop.example/ok", title: "T".repeat(512) },
+    ];
+    const { chat, fake } = setup({ token: ALICE, context: () => pages.shift() as PageContext });
+    for (const t of ["a", "b", "c", "d"]) ok(await chat.send(t));
+    expect(contexts(fake)).toEqual([TZ, TZ, TZ, { ...TZ, url: "https://shop.example/ok", title: "T".repeat(512) }]);
+    expect(warn).toHaveBeenCalledTimes(3);
+  });
+
+  it("sends without the page's part when the option throws, gives no JSON object or takes over 5 s, and warns", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const broken = new Error("broken view");
+    const answers: Array<() => unknown> = [
+      () => {
+        throw broken;
+      },
+      () => "orders",
+      () => [1, 2],
+      () => {
+        const o: Record<string, unknown> = {};
+        o.self = o;
+        return o;
+      },
+      () => new Promise(() => {}),
+    ];
+    const { chat, fake } = setup({ token: ALICE, context: () => answers.shift()!() as PageContext });
+    for (const t of ["a", "b", "c", "d"]) ok(await chat.send(t));
+    const p = chat.send("e");
+    await vi.advanceTimersByTimeAsync(5_100);
+    ok(await p);
+    expect(contexts(fake)).toEqual([TZ, TZ, TZ, TZ, TZ]);
+    expect(warn).toHaveBeenCalledTimes(2); // once for each reason
+    expect(warn.mock.calls[0][1]).toBe(broken);
+  });
+
+  it("sends only the time zone to a chat that doesn't say its most, which predates the context", async () => {
+    const fake = new FakeChat();
+    fake.contextMax = null;
+    const view = fill(20_000);
+    const { chat } = setup({ token: ALICE, context: () => ({ view }) }, fake);
+    ok(await chat.send("q"));
+    expect(contexts(fake)).toEqual([TZ]);
+  });
+
+  it("ends a message waiting on the context option when the page moves on", async () => {
+    const { chat, fake } = setup({ token: ALICE, context: () => new Promise<PageContext>(() => {}) });
+    await chat.open();
+    const p = chat.send("q");
+    await new Promise((r) => setTimeout(r, 5));
+    chat.newConversation();
+    expect(err(await p).code).toBe("aborted");
+    expect(contexts(fake)).toEqual([]);
+  });
+
+  it("checks the context option", () => {
+    expect(() => createChat({ url: ORIGIN, context: "x" as never })).toThrow(/context must be a function/);
+    expect(() => createChat({ url: ORIGIN, context: undefined })).not.toThrow();
+  });
+});
+
+describe("files", () => {
+  function png(name = "photo.png", size = 1000): File {
+    const b = new Uint8Array(size);
+    b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    return new File([b], name, { type: "image/png" });
+  }
+
+  async function attached(p: Promise<AttachResult>): Promise<ChatFile> {
+    const r = await p;
+    if (!r.ok) throw r.error;
+    return r.file;
+  }
+
+  async function read(p: Promise<ReadFileResult>): Promise<Blob> {
+    const r = await p;
+    if (!r.ok) throw r.error;
+    return r.blob;
+  }
+
+  async function refused(p: Promise<AttachResult | ReadFileResult>): Promise<ChatError> {
+    const r = await p;
+    if (r.ok) throw new Error("expected a failure");
+    return r.error;
+  }
+
+  const uploads = (fake: FakeChat) => fake.requests("POST").filter((s) => s.path.startsWith("/chat/v1/files"));
+
+  const hang = (_u: unknown, i?: RequestInit) =>
+    new Promise<Response>((_r, reject) => i!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+
+  function withXHR(fake: FakeChat, stall = false) {
+    const X = xhrOf(fake, stall);
+    vi.stubGlobal("XMLHttpRequest", X);
+    return X;
+  }
+
+  it("uploads a file through the page's fetch as the session's user, changing nothing in the state", async () => {
+    const { chat, fake, states } = setup({ token: ALICE });
+    await chat.open();
+    const n = states.length;
+    const f = await attached(chat.attach(png("cat.png", 1000)));
+    expect(f).toEqual({ id: expect.any(String), name: "cat.png", type: "image/png", size: 1000, createdAt: "2026-11-17T00:00:00Z" });
+    const [up] = uploads(fake);
+    expect(up.path).toBe("/chat/v1/files?name=cat.png");
+    expect(up.headers.get("Content-Type")).toBe("image/png");
+    expect(up.init.credentials).toBe("include");
+    expect(up.body).toBeInstanceOf(Blob);
+    expect(up.auth).toBeNull();
+    expect(states).toHaveLength(n);
+  });
+
+  it("opens the session first when needed, as send does", async () => {
+    const { chat, fake } = setup({ token: ALICE });
+    await attached(chat.attach(png()));
+    expect(fake.seen.map((s) => s.method + " " + s.path.split("?")[0])).toEqual([
+      "POST /chat/v1/session",
+      "GET /chat/v1/session",
+      "POST /chat/v1/files",
+    ]);
+    expect(chat.getState().status).toBe("ready");
+  });
+
+  it("reports an upload's progress through XMLHttpRequest, with the cookie or the bearer the session needs", async () => {
+    for (const keepsCookie of [true, false]) {
+      const fake = new FakeChat();
+      fake.keepsCookie = keepsCookie;
+      const X = withXHR(fake);
+      const { chat } = setup({ token: ALICE }, fake);
+      const seen: Array<[number, number]> = [];
+      const f = await attached(chat.attach(png("a.png", 400), { onProgress: (sent, total) => seen.push([sent, total]) }));
+      expect(f).toMatchObject({ name: "a.png", type: "image/png", size: 400 });
+      expect(seen).toEqual([[100, 400], [200, 400], [300, 400], [400, 400]]);
+      expect(X.sent).toHaveLength(1);
+      expect(X.sent[0]).toMatchObject({ method: "POST", url: ORIGIN + "/chat/v1/files?name=a.png", withCredentials: true });
+      expect(X.sent[0].headers["Content-Type"]).toBe("image/png");
+      expect(X.sent[0].headers.Authorization).toBe(keepsCookie ? undefined : "Bearer " + ALICE);
+    }
+  });
+
+  it("names an upload as the page says, as the File is, or file, and sends the type it believes", async () => {
+    const { chat, fake } = setup({ token: ALICE });
+    const csv = await attached(chat.attach(new File(["a,b"], "data.csv")));
+    await attached(chat.attach(new Blob(["hi"])));
+    await attached(chat.attach(png(), { name: "my cat " + String.fromCharCode(0xd800) + ".png" }));
+    await attached(chat.attach(png(), { name: "" }));
+    expect(uploads(fake).map((s) => [new URL(s.url).searchParams.get("name"), s.headers.get("Content-Type")])).toEqual([
+      ["data.csv", "application/octet-stream"],
+      ["file", "application/octet-stream"],
+      ["my cat " + String.fromCharCode(0xfffd) + ".png", "image/png"],
+      ["file", "image/png"],
+    ]);
+    expect(csv.type).toBe("text/plain"); // the chat reads it from the bytes
+  });
+
+  it("refuses a file larger than the proxy takes, without sending it", async () => {
+    const { chat, fake } = setup({ token: ALICE });
+    expect(await refused(chat.attach(new Blob([new Uint8Array((10 << 20) + 1)])))).toMatchObject({ code: "too_large", status: 0 });
+    expect(fake.seen).toHaveLength(0);
+  });
+
+  it("shows what the chat takes once a session says so: null before, and while it takes no file", async () => {
+    const fake = new FakeChat();
+    fake.maxFileBytes = 5 << 20;
+    fake.perMessage = 3;
+    const { chat } = setup({ tokenUrl: TOKEN_URL }, fake);
+    expect(chat.getState().files).toBeNull();
+    const first = (await chat.open()).files;
+    expect(first).toEqual({ types: TYPES, maxBytes: 5 << 20, perMessage: 3 });
+    for (const s of fake.sessions.values()) s.alive = false;
+    ok(await chat.send("q")); // the session opened again says the same
+    expect(chat.getState().files).toBe(first);
+    fake.fileTypes = ["application/pdf"];
+    expect((await chat.reopen()).files).toEqual({ types: ["application/pdf"], maxBytes: 5 << 20, perMessage: 3 });
+    fake.fileTypes = [];
+    expect((await chat.reopen()).files).toBeNull();
+    fake.fileTypes = TYPES.slice();
+    fake.attachments = false;
+    expect((await chat.reopen()).files).toBeNull();
+    fake.attachments = true;
+    expect((await chat.reopen()).files).not.toBeNull();
+    await chat.signOut();
+    expect(chat.getState().files).toBeNull();
+  });
+
+  it("keeps what the chat takes when the page is wiped for another user", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ tokenUrl: TOKEN_URL }, fake);
+    await chat.open();
+    for (const s of fake.sessions.values()) s.alive = false;
+    fake.tokenAnswers.push({ status: 200, body: { token: BOB } });
+    expect(err(await chat.send("alice's draft")).code).toBe("session_expired");
+    expect(chat.getState()).toMatchObject({ messages: [], outgoing: null, files: { maxBytes: 7 << 20 } });
+  });
+
+  it("refuses a file past the chat's most without sending it, once its session says", async () => {
+    const fake = new FakeChat();
+    fake.maxFileBytes = 500;
+    const { chat } = setup({ token: ALICE }, fake);
+    expect(await refused(chat.attach(png("big.png", 501)))).toMatchObject({ code: "too_large", status: 0 });
+    expect(sessionPaths(fake)).toEqual(["POST", "GET"]);
+    expect(uploads(fake)).toHaveLength(0);
+    expect((await attached(chat.attach(png("fits.png", 500)))).size).toBe(500);
+    expect(uploads(fake)).toHaveLength(1);
+  });
+
+  it("refuses at once where the chat's session takes no file, and reads a file already sent all the same", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    const f = await attached(chat.attach(png("p.png", 64)));
+    fake.attachments = false;
+    expect((await chat.reopen({ token: ALICE })).files).toBeNull();
+    expect(await refused(chat.attach(png()))).toMatchObject({ code: "attachments_off", status: 0 });
+    expect(uploads(fake)).toHaveLength(1);
+    expect((await read(chat.readFile(f))).size).toBe(64);
+  });
+
+  it("leaves the chat to answer where its session says nothing of files it can read", async () => {
+    const fake = new FakeChat();
+    fake.saysFiles = false;
+    const { chat } = setup({ token: ALICE }, fake);
+    expect((await chat.open()).files).toBeNull();
+    expect((await attached(chat.attach(png()))).type).toBe("image/png");
+    fake.maxFileBytes = 500;
+    expect(await refused(chat.attach(png("big.png", 600)))).toMatchObject({ code: "too_large", status: 413 });
+    expect(await refused(chat.attach(new Blob([new Uint8Array((10 << 20) + 1)])))).toMatchObject({ code: "too_large", status: 0 });
+    expect(uploads(fake)).toHaveLength(2);
+    const odd = createChat({
+      url: ORIGIN,
+      fetch: async (u, i) =>
+        String(u).endsWith("/session") && i?.method === "POST"
+          ? json(200, { anonymous: false, started: false, conversation: null, messages: [], answering: false, files: { types: "all" } })
+          : fake.fetch(u, i),
+    });
+    expect((await odd.open()).files).toBeNull();
+    expect((await attached(odd.attach(png("p.png", 400)))).size).toBe(400);
+  });
+
+  it("says why the chat refused a file when what its session said has changed, trying none of those again", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open(); // its session takes files, up to 7 MiB
+    fake.attachments = false;
+    const off = await refused(chat.attach(png()));
+    fake.attachments = true;
+    fake.maxFileBytes = 500;
+    const large = await refused(chat.attach(png("big.png", 600)));
+    const kind = await refused(chat.attach(new File([new Uint8Array([0, 1, 2])], "x.bin")));
+    fake.storageBytes = 700;
+    await attached(chat.attach(png("one.png", 400)));
+    const full = await refused(chat.attach(png("two.png", 400)));
+    expect([off, large, kind, full].map((e) => [e.code, e.status, e.retryable])).toEqual([
+      ["attachments_off", 403, false],
+      ["too_large", 413, false],
+      ["unsupported_type", 415, false],
+      ["storage_full", 403, false],
+    ]);
+    expect(uploads(fake)).toHaveLength(5);
+  });
+
+  it("opens the session again when it ended, and uploads the file once more, only once", async () => {
+    const fake = new FakeChat();
+    const X = withXHR(fake);
+    const { chat } = setup({ tokenUrl: TOKEN_URL }, fake);
+    await chat.open();
+    for (const s of fake.sessions.values()) s.alive = false;
+    const sent: number[] = [];
+    expect((await attached(chat.attach(png("a.png", 400), { onProgress: (n) => sent.push(n) }))).name).toBe("a.png");
+    expect(X.sent).toHaveLength(2);
+    expect(sent).toEqual([100, 200, 300, 400, 100, 200, 300, 400]);
+    expect(fake.tokenCalls).toBe(2);
+    fake.refusals.push({ method: "POST", path: /\/files/, status: 401, error: "session_expired" });
+    expect((await refused(chat.attach(png()))).code).toBe("session_expired");
+    expect(uploads(fake)).toHaveLength(4);
+  });
+
+  it("waits as the chat says when it's short of memory or uploads come too fast, up to a minute", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    fake.refusals.push(
+      { method: "POST", path: /\/files/, status: 503, error: "overloaded", retryAfter: 2, times: 1 },
+      { method: "POST", path: /\/files/, status: 429, error: "rate_limited", retryAfter: 1, times: 1 },
+    );
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    const p = chat.attach(png());
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(uploads(fake)).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1000);
+    await attached(p);
+    expect(uploads(fake)).toHaveLength(3);
+    expect(chat.getState().waiting).toBeNull();
+
+    fake.refusals.push({ method: "POST", path: /\/files/, status: 503, error: "overloaded", retryAfter: 30 });
+    const q = chat.attach(png());
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(await refused(q)).toMatchObject({ code: "overloaded", retryAfter: 30 });
+    expect(uploads(fake)).toHaveLength(6); // at 0, 30 and 60 s
+  });
+
+  it("never uploads a file again when its answer was lost: it may have been stored", async () => {
+    const fake = new FakeChat();
+    let tries = 0;
+    const chat = createChat({
+      url: ORIGIN,
+      token: ALICE,
+      fetch: (u, i) => (String(u).includes("/files") ? (tries++, Promise.reject(new TypeError("offline"))) : fake.fetch(u, i)),
+    });
+    expect((await refused(chat.attach(png()))).code).toBe("network");
+    expect(tries).toBe(1);
+  });
+
+  it("cuts an upload short on the page's signal, or when the user changes", async () => {
+    const fake = new FakeChat();
+    const chat = createChat({ url: ORIGIN, token: ALICE, fetch: (u, i) => (String(u).includes("/files") ? hang(u, i) : fake.fetch(u, i)) });
+    await chat.open();
+    const stop = new AbortController();
+    const p = chat.attach(png(), { signal: stop.signal });
+    await new Promise((r) => setTimeout(r, 5));
+    stop.abort();
+    expect((await refused(p)).code).toBe("aborted");
+    const q = chat.attach(png());
+    await new Promise((r) => setTimeout(r, 5));
+    await chat.reopen({ token: BOB });
+    expect((await refused(q)).code).toBe("aborted");
+    const n = fake.seen.length;
+    expect((await refused(chat.attach(png(), { signal: stop.signal }))).code).toBe("aborted");
+    expect(fake.seen).toHaveLength(n);
+  });
+
+  it("gives up on an upload that makes no progress for 30 s", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const X = withXHR(fake, true);
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    let settled = false;
+    const p = chat.attach(png(), { onProgress: () => {} });
+    void p.then(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await refused(p)).code).toBe("network");
+    expect(X.sent[0].aborted).toBe(true);
+  });
+
+  it("gives an upload through fetch time for its size before its answer must start", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const chat = createChat({ url: ORIGIN, token: ALICE, fetch: (u, i) => (String(u).includes("/files") ? hang(u, i) : fake.fetch(u, i)) });
+    await chat.open();
+    let settled = false;
+    const p = chat.attach(png("big.png", 1 << 20));
+    void p.then(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(false); // 30 s, and 1 MiB at 32 KB/s
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect((await refused(p)).code).toBe("network");
+  });
+
+  it("checks its arguments", () => {
+    const { chat, fake } = setup({ token: ALICE });
+    expect(() => chat.attach("x" as never)).toThrow(TypeError);
+    expect(() => chat.attach(png(), null as never)).toThrow(TypeError);
+    expect(() => chat.attach(png(), { nmae: "x" } as never)).toThrow(/unknown option nmae/);
+    expect(() => chat.attach(png(), { name: 1 } as never)).toThrow(TypeError);
+    expect(() => chat.attach(png(), { onProgress: 1 } as never)).toThrow(TypeError);
+    expect(() => chat.attach(png(), { signal: {} } as never)).toThrow(TypeError);
+    expect(() => chat.send("q", { file: [] } as never)).toThrow(/unknown option file/);
+    expect(() => chat.send("q", { files: "f1" } as never)).toThrow(TypeError);
+    expect(() => chat.send("q", { files: [{}] } as never)).toThrow(TypeError);
+    expect(() => chat.readFile("")).toThrow(TypeError);
+    expect(() => chat.readFile({ id: 1 } as never)).toThrow(TypeError);
+    expect(() => chat.readFile("f1", { sginal: undefined } as never)).toThrow(/unknown option sginal/);
+    expect(fake.seen).toHaveLength(0);
+  });
+
+  it("sends a message with files, by their ChatFiles or ids, its text empty or not", async () => {
+    const { chat, fake } = setup({ token: ALICE });
+    const a = await attached(chat.attach(png("a.png")));
+    const b = await attached(chat.attach(new File(["# Notes"], "notes.md", { type: "text/markdown" })));
+    expect(b.type).toBe("text/markdown");
+    expect(ok(await chat.send("  ", { files: [a, b.id] })).message.text).toBe("Hello");
+    expect(fake.requests("POST", "/chat/v1/conversations")[0].body).toEqual({ text: "", files: [a.id, b.id], context: TZ });
+    expect(chat.getState().messages[0]).toMatchObject({ role: "user", text: "" });
+    expect(chat.getState().messages[0].files).toEqual([a, b]);
+    const c = await attached(chat.attach(png("c.png")));
+    ok(await chat.send("And this", { files: [c] }));
+    ok(await chat.send("Plain", { files: [] }));
+    expect(fake.requests("POST").filter((s) => s.path.endsWith("/messages")).map((s) => s.body)).toEqual([
+      { text: "And this", files: [c.id], context: TZ },
+      { text: "Plain", context: TZ },
+    ]);
+    expect(chat.getState().messages.map((m) => (m.files ? m.files.length : 0))).toEqual([2, 0, 1, 0, 0, 0]);
+  });
+
+  it("keeps a message with files the chat refused, with its error", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    const a = await attached(chat.attach(png()));
+    ok(await chat.send("first", { files: [a] }));
+    expect(err(await chat.send("again", { files: [a] }))).toMatchObject({ code: "bad_request", status: 400 });
+    expect(chat.getState()).toMatchObject({ outgoing: "again", error: { code: "bad_request" } });
+    fake.attachments = false;
+    expect(err(await chat.send("", { files: ["f-other"] })).code).toBe("attachments_off");
+    expect(err(await chat.send("", {})).code).toBe("bad_request");
+  });
+
+  it("finds a message of files alone whose answer was lost, by its file", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    fake.turns.push({ drop: "before-conversation", text: "Seen it", pollsAnswering: 0 });
+    const { chat } = setup({ token: ALICE }, fake);
+    const f = await attached(chat.attach(png()));
+    const p = chat.send("", { files: [f] });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ok(await p).message.text).toBe("Seen it");
+    expect(chat.getState().messages.map((m) => [m.text, m.files ? m.files.map((x) => x.id) : []])).toEqual([
+      ["", [f.id]],
+      ["Seen it", []],
+    ]);
+    expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(1);
+  });
+
+  it("reads a file with the session's credentials: the cookie, the customer's token or the session token", async () => {
+    const cases: Array<[Partial<ChatOptions>, boolean, unknown]> = [
+      [{ token: ALICE }, true, null],
+      [{ token: ALICE }, false, "Bearer " + ALICE],
+      [{}, false, expect.stringMatching(/^Bearer h_/)],
+    ];
+    for (const [opts, keepsCookie, auth] of cases) {
+      const fake = new FakeChat();
+      fake.keepsCookie = keepsCookie;
+      const { chat } = setup(opts, fake);
+      const f = await attached(chat.attach(png("p.png", 64)));
+      const blob = await read(chat.readFile(f));
+      expect(blob.type).toBe("image/png");
+      expect(new Uint8Array(await blob.arrayBuffer())).toEqual(fake.files.get(f.id)!.bytes);
+      const [get] = fake.requests("GET", "/chat/v1/files/" + f.id);
+      expect(get.auth).toEqual(auth);
+      expect(get.init.credentials).toBe("include");
+    }
+  });
+
+  it("reads a file by its id on a page that hasn't opened the chat, opening it first", async () => {
+    const fake = new FakeChat();
+    const f = await attached(setup({ token: ALICE }, fake).chat.attach(png("p.png", 64)));
+    const { chat } = setup({ token: ALICE }, fake);
+    expect((await read(chat.readFile(f.id))).size).toBe(64);
+    expect(chat.getState().status).toBe("ready");
+  });
+
+  it("hands over anything but an image as a file to save, never one to render, whatever the chat says", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    const t = await attached(chat.attach(new File(["hello"], "a.txt", { type: "text/plain" })));
+    expect(t.type).toBe("text/plain");
+    const blob = await read(chat.readFile(t));
+    expect(blob.type).toBe("application/octet-stream");
+    expect(await blob.text()).toBe("hello");
+    const odd = createChat({
+      url: ORIGIN,
+      token: ALICE,
+      fetch: async (u, i) => (String(u).includes("/files/") ? new Response("<script>", { headers: { "Content-Type": "text/html" } }) : fake.fetch(u, i)),
+    });
+    expect((await read(odd.readFile("f1"))).type).toBe("application/octet-stream");
+  });
+
+  it("says not_found for a file someone else attached", async () => {
+    const fake = new FakeChat();
+    const f = await attached(setup({ token: ALICE }, fake).chat.attach(png()));
+    const { chat } = setup({ token: BOB }, fake);
+    expect(await refused(chat.readFile(f))).toMatchObject({ code: "not_found", status: 404 });
+  });
+
+  it("reads stored messages' files in camelCase, dropping any it can't read", async () => {
+    const fake = new FakeChat();
+    const c = fake.conversation("alice", "", ["look", "nice"]);
+    c.messages[0].files = [{ id: "f9", name: "cat.png", type: "image/png", size: 3, created_at: "2026-11-17T00:00:00Z" }, { name: "x" } as never];
+    const { chat } = setup({ token: ALICE }, fake);
+    const st = await chat.open();
+    expect(st.messages[0].files).toEqual([{ id: "f9", name: "cat.png", type: "image/png", size: 3, createdAt: "2026-11-17T00:00:00Z" }]);
+    expect(st.messages[1].files).toBeUndefined();
   });
 });
