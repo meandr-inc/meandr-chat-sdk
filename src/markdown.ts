@@ -52,19 +52,19 @@ type Align = "left" | "center" | "right";
 interface Blk {
   t: string;
   s: string;
-  lang?: string;
-  kids?: Blk[];
-  items?: Blk[][];
-  start?: number;
-  tight?: boolean;
-  rows?: string[][];
-  align?: (Align | "")[];
+  lang_?: string;
+  kids_?: Blk[];
+  items_?: Blk[][];
+  start_?: number;
+  tight_?: boolean;
+  rows_?: string[][];
+  align_?: (Align | "")[];
 }
-interface Fence { ch: string; len: number; ind: number; info: string }
-interface Item { ordered: boolean; mark: string; start: number; indent: number; content: string; empty: boolean }
-interface Inl { k: number; s: string; href: string; dest: string; kid: Inl | null; prev: Inl | null; next: Inl | null }
-interface Delim { node: Inl; ch: string; n: number; orig: number; open: boolean; close: boolean; id: number; prev: Delim | null; next: Delim | null }
-interface Bracket { node: Inl; img: boolean; active: boolean; inner: boolean; delim: Delim | null; prev: Bracket | null }
+interface Fence { ch: string; len_: number; ind_: number; info_: string }
+interface Item { ordered_: boolean; mark_: string; start_: number; indent_: number; content_: string; empty_: boolean }
+interface Inl { k: number; s: string; href_: string; dest_: string; kid_: Inl | null; prev_: Inl | null; next_: Inl | null }
+interface Delim { node_: Inl; ch: string; n: number; orig_: number; open_: boolean; close_: boolean; id: number; prev_: Delim | null; next_: Delim | null }
+interface Bracket { node_: Inl; img_: boolean; active_: boolean; inner_: boolean; delim_: Delim | null; prev_: Bracket | null }
 
 /**
  * The tree is safe as it stands: every tag is on the list above, every href is checked, and a labeled link
@@ -72,7 +72,7 @@ interface Bracket { node: Inl; img: boolean; active: boolean; inner: boolean; de
  */
 export function parseMarkdown(text: string): MarkdownNode[] {
   const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n").map(detab);
-  return blockTree(parseBlocks(lines, 0).out, false);
+  return blockTree(parseBlocks(lines, 0).out_, false);
 }
 
 export function renderMarkdown(text: string, doc: Document = document): DocumentFragment {
@@ -83,7 +83,7 @@ export function renderMarkdown(text: string, doc: Document = document): Document
 
 // ---- blocks ----
 
-function parseBlocks(lines: string[], depth: number): { out: Blk[]; loose: boolean } {
+function parseBlocks(lines: string[], depth: number): { out_: Blk[]; loose_: boolean } {
   const out: Blk[] = [];
   const nest = depth < MAX_DEPTH;
   const n = lines.length;
@@ -93,15 +93,15 @@ function parseBlocks(lines: string[], depth: number): { out: Blk[]; loose: boole
     if (isBlank(line)) { gap = out.length > 0; i++; continue; }
     if (gap) loose = true;
     gap = false;
-    let f: Fence | null, h: { level: number; text: string } | null, li: Item | null, align: (Align | "")[] | null;
+    let f: Fence | null, h: { level_: number; text_: string } | null, li: Item | null, align: (Align | "")[] | null;
     if ((f = fenceOpen(line))) {
       const code: string[] = [];
-      for (i++; i < n && !fenceClose(lines[i], f); i++) code.push(dedent(lines[i], f.ind));
+      for (i++; i < n && !fenceClose(lines[i], f); i++) code.push(dedent(lines[i], f.ind_));
       i++;
-      const lang = f.info.split(/\s/)[0];
-      out.push({ t: "pre", s: code.join("\n"), lang: LANG.test(lang) ? lang : "" });
+      const lang = f.info_.split(/\s/)[0];
+      out.push({ t: "pre", s: code.join("\n"), lang_: LANG.test(lang) ? lang : "" });
     } else if ((h = heading(line))) {
-      out.push({ t: "h" + h.level, s: h.text });
+      out.push({ t: "h" + h.level_, s: h.text_ });
       i++;
     } else if (isHr(line)) {
       out.push({ t: "hr", s: "" });
@@ -118,20 +118,20 @@ function parseBlocks(lines: string[], depth: number): { out: Blk[]; loose: boole
         fs = fenceStep(fs, l);
         i++;
       }
-      out.push({ t: "blockquote", s: "", kids: parseBlocks(inner, depth + 1).out });
+      out.push({ t: "blockquote", s: "", kids_: parseBlocks(inner, depth + 1).out_ });
     } else if (nest && (li = listItem(line))) {
       const first = li, items: Blk[][] = [];
       let cur: Item = li, lz = false;
       for (;;) {
-        const body = [cur.content];
-        let fs = fenceStep(null, cur.content), blank = -1;
+        const body = [cur.content_];
+        let fs = fenceStep(null, cur.content_), blank = -1;
         for (i++; i < n; i++) {
           const l = lines[i];
           if (isBlank(l)) { if (blank < 0) blank = i; continue; }
-          if (indentOf(l) >= cur.indent) {
+          if (indentOf(l) >= cur.indent_) {
             for (; blank >= 0 && blank < i; blank++) body.push("");
             blank = -1;
-            const d = dedent(l, cur.indent);
+            const d = dedent(l, cur.indent_);
             body.push(d);
             fs = fenceStep(fs, d);
             continue;
@@ -141,28 +141,28 @@ function parseBlocks(lines: string[], depth: number): { out: Blk[]; loose: boole
         }
         if (blank >= 0) i = blank;
         const r = parseBlocks(body, depth + 1);
-        items.push(r.out);
-        if (r.loose) lz = true;
+        items.push(r.out_);
+        if (r.loose_) lz = true;
         let j = i;
         while (j < n && isBlank(lines[j])) j++;
         const next = j < n ? listItem(lines[j]) : null;
-        if (!next || next.ordered !== first.ordered || next.mark !== first.mark) break;
+        if (!next || next.ordered_ !== first.ordered_ || next.mark_ !== first.mark_) break;
         if (j > i) lz = true;
         i = j;
         cur = next;
       }
-      out.push({ t: first.ordered ? "ol" : "ul", s: "", start: first.start, tight: !lz, items });
+      out.push({ t: first.ordered_ ? "ol" : "ul", s: "", start_: first.start_, tight_: !lz, items_: items });
     } else if ((align = tableAt(lines, i))) {
       const rows = [cells(line, MAX_COLS)];
       for (i += 2; i < n && !isBlank(lines[i]) && !startsBlock(lines[i], nest); i++) rows.push(cells(lines[i], MAX_COLS));
-      out.push({ t: "table", s: "", rows, align: align.slice(0, MAX_COLS) });
+      out.push({ t: "table", s: "", rows_: rows, align_: align.slice(0, MAX_COLS) });
     } else {
       const buf = [line.trim()];
       for (i++; i < n && !isBlank(lines[i]) && !startsBlock(lines[i], nest) && !tableAt(lines, i); i++) buf.push(lines[i].trim());
       out.push({ t: "p", s: buf.join("\n") });
     }
   }
-  return { out, loose };
+  return { out_: out, loose_: loose };
 }
 
 function isBlank(l: string | undefined): boolean {
@@ -207,21 +207,21 @@ function fenceOpen(l: string): Fence | null {
   let e = ind;
   while (l.charAt(e) === ch) e++;
   const info = l.slice(e).trim();
-  return e - ind >= 3 && !(ch === "`" && info.indexOf("`") >= 0) ? { ch, len: e - ind, ind, info } : null;
+  return e - ind >= 3 && !(ch === "`" && info.indexOf("`") >= 0) ? { ch, len_: e - ind, ind_: ind, info_: info } : null;
 }
 
 function fenceClose(l: string, f: Fence): boolean {
   const s = lead(l);
   let e = s;
   while (l.charAt(e) === f.ch) e++;
-  return e - s >= f.len && isBlank(l.slice(e));
+  return e - s >= f.len_ && isBlank(l.slice(e));
 }
 
 function fenceStep(f: Fence | null, l: string): Fence | null {
   return f ? (fenceClose(l, f) ? null : f) : fenceOpen(l);
 }
 
-function heading(l: string): { level: number; text: string } | null {
+function heading(l: string): { level_: number; text_: string } | null {
   const s = lead(l);
   let e = s;
   while (e - s < 7 && l.charAt(e) === "#") e++;
@@ -230,7 +230,7 @@ function heading(l: string): { level: number; text: string } | null {
   let t = l.slice(e).trim(), k = t.length;
   while (k > 0 && t.charAt(k - 1) === "#") k--;
   if (k === 0 || t.charAt(k - 1) === " " || t.charAt(k - 1) === "\t") t = t.slice(0, k).trim();
-  return { level, text: t };
+  return { level_: level, text_: t };
 }
 
 function isHr(l: string): boolean {
@@ -270,7 +270,7 @@ function listItem(l: string): Item | null {
   while (l.charAt(e) === " " || l.charAt(e) === "\t") e++;
   if (e === p && e < l.length) return null;
   const empty = e >= l.length, wide = e - p > 4;
-  return { ordered, mark, start, indent: empty || wide ? p + 1 : e, content: empty ? "" : l.slice(wide ? p + 1 : e), empty };
+  return { ordered_: ordered, mark_: mark, start_: start, indent_: empty || wide ? p + 1 : e, content_: empty ? "" : l.slice(wide ? p + 1 : e), empty_: empty };
 }
 
 function startsBlock(l: string, nest: boolean): boolean {
@@ -278,7 +278,7 @@ function startsBlock(l: string, nest: boolean): boolean {
   if (!nest) return false;
   if (quoteStrip(l) !== null) return true;
   const m = listItem(l);
-  return m !== null && !m.empty && (!m.ordered || m.start === 1);
+  return m !== null && !m.empty_ && (!m.ordered_ || m.start_ === 1);
 }
 
 // A row's cells, at most max: past that, the rest of the row joins the last cell's text.
@@ -323,13 +323,13 @@ function tableAt(lines: string[], i: number): (Align | "")[] | null {
 // ---- inlines ----
 
 function mk(k: number, s: string): Inl {
-  return { k, s, href: "", dest: "", kid: null, prev: null, next: null };
+  return { k, s, href_: "", dest_: "", kid_: null, prev_: null, next_: null };
 }
 
 function anchor(href: string, kid: Inl): Inl {
   const a = mk(EL, "a");
-  a.href = href;
-  a.kid = kid;
+  a.href_ = href;
+  a.kid_ = kid;
   return a;
 }
 
@@ -348,13 +348,13 @@ function special(c: number): boolean {
 function parseInline(src: string): Inl | null {
   const head = mk(EL, ""), len = src.length;
   let tail = head, dtop: Delim | null = null, btop = null as Bracket | null, ids = 0, i = 0, rp = 0, url = -1;
-  const push = (x: Inl) => { tail.next = x; x.prev = tail; tail = x; };
+  const push = (x: Inl) => { tail.next_ = x; x.prev_ = tail; tail = x; };
   const text = (s: string) => { if (tail.k === TEXT) tail.s += s; else push(mk(TEXT, s)); };
-  const unlink = (x: Inl) => { x.prev!.next = x.next; if (x.next) x.next.prev = x.prev; else tail = x.prev!; };
+  const unlink = (x: Inl) => { x.prev_!.next_ = x.next_; if (x.next_) x.next_.prev_ = x.prev_; else tail = x.prev_!; };
   const drop = (d: Delim) => {
-    d.node.s = d.node.s.slice(0, d.n);
-    if (d.prev) d.prev.next = d.next;
-    if (d.next) d.next.prev = d.prev; else dtop = d.prev;
+    d.node_.s = d.node_.s.slice(0, d.n);
+    if (d.prev_) d.prev_.next_ = d.next_;
+    if (d.next_) d.next_.prev_ = d.prev_; else dtop = d.prev_;
   };
 
   // CommonMark's "process emphasis"; floor[] bounds each opener search so the whole pass stays linear.
@@ -362,34 +362,34 @@ function parseInline(src: string): Inl | null {
     const bid = bottom ? bottom.id : -1, floor: { [key: string]: number } = {};
     let c = dtop;
     if (!c || c.id <= bid) return;
-    while (c.prev && c.prev.id > bid) c = c.prev;
+    while (c.prev_ && c.prev_.id > bid) c = c.prev_;
     while (c) {
-      if (!c.close) { c = c.next; continue; }
-      const key = c.ch + (c.open ? "1" : "0") + (c.orig % 3);
+      if (!c.close_) { c = c.next_; continue; }
+      const key = c.ch + (c.open_ ? "1" : "0") + (c.orig_ % 3);
       const lim = Math.max(bid, key in floor ? floor[key] : -1);
-      let o: Delim | null = c.prev;
-      while (o && o.id > lim && !(o.ch === c.ch && o.open && pairs(o, c))) o = o.prev;
+      let o: Delim | null = c.prev_;
+      while (o && o.id > lim && !(o.ch === c.ch && o.open_ && pairs(o, c))) o = o.prev_;
       if (o && o.id > lim) {
         const use = c.ch === "~" || (c.n > 1 && o.n > 1) ? 2 : 1;
         o.n -= use;
         c.n -= use;
         const el = mk(EL, c.ch === "~" ? "del" : use === 2 ? "strong" : "em");
-        if (o.node.next !== c.node) {
-          const first = o.node.next!, last = c.node.prev!;
-          first.prev = null;
-          last.next = null;
-          el.kid = first;
+        if (o.node_.next_ !== c.node_) {
+          const first = o.node_.next_!, last = c.node_.prev_!;
+          first.prev_ = null;
+          last.next_ = null;
+          el.kid_ = first;
         }
-        o.node.next = el; el.prev = o.node; el.next = c.node; c.node.prev = el;
-        for (let d = o.next; d && d !== c; d = d.next) d.node.s = d.node.s.slice(0, d.n);
-        o.next = c;
-        c.prev = o;
-        if (!o.n) { unlink(o.node); drop(o); }
-        if (!c.n) { unlink(c.node); const nx: Delim | null = c.next; drop(c); c = nx; }
+        o.node_.next_ = el; el.prev_ = o.node_; el.next_ = c.node_; c.node_.prev_ = el;
+        for (let d = o.next_; d && d !== c; d = d.next_) d.node_.s = d.node_.s.slice(0, d.n);
+        o.next_ = c;
+        c.prev_ = o;
+        if (!o.n) { unlink(o.node_); drop(o); }
+        if (!c.n) { unlink(c.node_); const nx: Delim | null = c.next_; drop(c); c = nx; }
       } else {
-        floor[key] = c.prev ? c.prev.id : -1;
-        const nx: Delim | null = c.next;
-        if (!c.open) drop(c);
+        floor[key] = c.prev_ ? c.prev_.id : -1;
+        const nx: Delim | null = c.next_;
+        if (!c.open_) drop(c);
         c = nx;
       }
     }
@@ -445,65 +445,65 @@ function parseInline(src: string): Inl | null {
       const x = mk(DELIM, src.slice(i, e));
       push(x);
       if ((open || close) && (c !== 126 || e - i === 2)) {
-        const d: Delim = { node: x, ch: src.charAt(i), n: e - i, orig: e - i, open, close, id: ids++, prev: dtop, next: null };
-        if (dtop) dtop.next = d;
+        const d: Delim = { node_: x, ch: src.charAt(i), n: e - i, orig_: e - i, open_: open, close_: close, id: ids++, prev_: dtop, next_: null };
+        if (dtop) dtop.next_ = d;
         dtop = d;
       }
       i = e;
     } else if (c === 91 || (c === 33 && src.charCodeAt(i + 1) === 91)) {
       const img = c === 33, x = mk(DELIM, img ? "![" : "[");
       push(x);
-      btop = { node: x, img, active: true, inner: false, delim: dtop, prev: btop };
+      btop = { node_: x, img_: img, active_: true, inner_: false, delim_: dtop, prev_: btop };
       i += img ? 2 : 1;
     } else if (c === 93) {
-      const b: Bracket | null = btop, L = b && b.active ? linkTail(src, i + 1) : null;
-      if (b) btop = b.prev;
+      const b: Bracket | null = btop, L = b && b.active_ ? linkTail(src, i + 1) : null;
+      if (b) btop = b.prev_;
       if (!b || !L) {
-        if (b && b.inner && btop) btop.inner = true;
+        if (b && b.inner_ && btop) btop.inner_ = true;
         text("]");
         i++;
         continue;
       }
-      emphasis(b.delim);
-      const kids = b.node.next, href = safeHref(L.dest);
-      if (b.img || href) {
+      emphasis(b.delim_);
+      const kids = b.node_.next_, href = safeHref(L.dest_);
+      if (b.img_ || href) {
         // An image around another link shows its own address: one label can't speak for two destinations.
-        let label = !b.img && kids ? kids : mk(TEXT, b.img && !(href && b.inner) ? plain(kids) : "");
+        let label = !b.img_ && kids ? kids : mk(TEXT, b.img_ && !(href && b.inner_) ? plain(kids) : "");
         if (href) tidy(label);
-        if (!plain(label)) label = mk(TEXT, href ? shown(href) : L.dest);
-        label.prev = null;
-        b.node.next = null;
-        tail = b.node;
+        if (!plain(label)) label = mk(TEXT, href ? shown(href) : L.dest_);
+        label.prev_ = null;
+        b.node_.next_ = null;
+        tail = b.node_;
         if (href) {
           // The note goes before the label: nothing in a label, however wide, can push it out of view.
           const a = anchor(href, label);
-          let p = b.node.prev!;
-          a.dest = note(plain(label), href);
-          if (a.dest) {
-            const n = mk(NOTE, "[" + a.dest + "] ");
-            p.next = n;
-            n.prev = p;
+          let p = b.node_.prev_!;
+          a.dest_ = note(plain(label), href);
+          if (a.dest_) {
+            const n = mk(NOTE, "[" + a.dest_ + "] ");
+            p.next_ = n;
+            n.prev_ = p;
             p = n;
           }
-          p.next = a;
-          a.prev = p;
+          p.next_ = a;
+          a.prev_ = p;
           tail = a;
         } else {
-          b.node.k = TEXT;
-          b.node.s = label.s;
+          b.node_.k = TEXT;
+          b.node_.s = label.s;
         }
-      } else unlink(b.node);
-      if (!b.img) for (let x = btop; x && x.active; x = x.prev) x.active = false;
-      if (btop && (b.img || href || b.inner)) btop.inner = true;
-      i = L.end;
+      } else unlink(b.node_);
+      if (!b.img_) for (let x = btop; x && x.active_; x = x.prev_) x.active_ = false;
+      if (btop && (b.img_ || href || b.inner_)) btop.inner_ = true;
+      i = L.end_;
     } else if (c === 60) {
       const al = autolink(src, i);
       if (!al) { text("<"); i++; continue; }
-      if (al.href) {
-        push(anchor(al.href, mk(TEXT, shown(al.href))));
-        if (btop) btop.inner = true;
-      } else text(al.text);
-      i = al.end;
+      if (al.href_) {
+        push(anchor(al.href_, mk(TEXT, shown(al.href_))));
+        if (btop) btop.inner_ = true;
+      } else text(al.text_);
+      i = al.end_;
     } else if (c === 38) {
       const en = entity(src, i);
       if (en) { text(en[0]); i = en[1]; } else { text("&"); i++; }
@@ -515,7 +515,7 @@ function parseInline(src: string): Inl | null {
       const u = src.slice(i, url), href = safeHref(u);
       if (href) {
         push(anchor(href, mk(TEXT, shown(href))));
-        if (btop) btop.inner = true;
+        if (btop) btop.inner_ = true;
       } else text(u);
       i = url;
     } else {
@@ -526,11 +526,11 @@ function parseInline(src: string): Inl | null {
     }
   }
   emphasis(null);
-  return head.next;
+  return head.next_;
 }
 
 function pairs(o: Delim, c: Delim): boolean {
-  return c.ch === "~" || !((o.close || c.open) && (o.orig + c.orig) % 3 === 0 && (o.orig % 3 !== 0 || c.orig % 3 !== 0));
+  return c.ch === "~" || !((o.close_ || c.open_) && (o.orig_ + c.orig_) % 3 === 0 && (o.orig_ % 3 !== 0 || c.orig_ % 3 !== 0));
 }
 
 function plain(n: Inl | null): string {
@@ -542,9 +542,9 @@ function plain(n: Inl | null): string {
       n = resume.pop()!;
       continue;
     }
-    if (n.k === EL) { resume.push(n.next); n = n.kid; continue; }
+    if (n.k === EL) { resume.push(n.next_); n = n.kid_; continue; }
     if (n.k !== NOTE) s += n.k === BR ? " " : n.s;
-    n = n.next;
+    n = n.next_;
   }
 }
 
@@ -555,7 +555,7 @@ function skipWs(s: string, p: number, lim: number): number {
 
 // The "(dest "title")" after "]"; a title is checked for syntax, then dropped. Scans are capped so a run
 // of unclosed links can't go quadratic.
-function linkTail(s: string, p: number): { dest: string; end: number } | null {
+function linkTail(s: string, p: number): { dest_: string; end_: number } | null {
   if (s.charAt(p) !== "(") return null;
   const lim = Math.min(s.length, p + 4096);
   p = skipWs(s, p + 1, lim);
@@ -597,10 +597,10 @@ function linkTail(s: string, p: number): { dest: string; end: number } | null {
     p = skipWs(s, p + 1, lim);
   }
   if (s.charAt(p) !== ")") return null;
-  return { dest: decode(dest), end: p + 1 };
+  return { dest_: decode(dest), end_: p + 1 };
 }
 
-function autolink(s: string, p: number): { text: string; href: string | null; end: number } | null {
+function autolink(s: string, p: number): { text_: string; href_: string | null; end_: number } | null {
   const lim = Math.min(s.length, p + 2048);
   let q = p + 1;
   while (q < lim) {
@@ -610,8 +610,8 @@ function autolink(s: string, p: number): { text: string; href: string | null; en
   }
   if (s.charAt(q) !== ">" || q === p + 1) return null;
   const t = s.slice(p + 1, q);
-  if (/^[A-Za-z][A-Za-z0-9+.-]{1,31}:/.test(t)) return { text: t, href: safeHref(t), end: q + 1 };
-  if (/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/.test(t)) return { text: t, href: safeHref("mailto:" + t), end: q + 1 };
+  if (/^[A-Za-z][A-Za-z0-9+.-]{1,31}:/.test(t)) return { text_: t, href_: safeHref(t), end_: q + 1 };
+  if (/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/.test(t)) return { text_: t, href_: safeHref("mailto:" + t), end_: q + 1 };
   return null;
 }
 
@@ -809,12 +809,12 @@ function eachText(n: Inl | null, fn: (x: Inl) => boolean): void {
       continue;
     }
     if (n.k === EL) {
-      resume.push(n.next);
-      n = n.kid;
+      resume.push(n.next_);
+      n = n.kid_;
       continue;
     }
     if (n.k !== NOTE && !fn(n)) return;
-    n = n.next;
+    n = n.next_;
   }
 }
 
@@ -836,21 +836,21 @@ function blockTree(bs: Blk[], tight: boolean): MarkdownNode[] {
         else out.push({ tag: "p", children: inlineTree(parseInline(b.s), [], 0, false) });
         break;
       case "pre":
-        out.push(b.lang ? { tag: "pre", language: b.lang, children: [clean(b.s)] } : { tag: "pre", children: [clean(b.s)] });
+        out.push(b.lang_ ? { tag: "pre", language: b.lang_, children: [clean(b.s)] } : { tag: "pre", children: [clean(b.s)] });
         break;
       case "blockquote":
-        out.push({ tag: "blockquote", children: blockTree(b.kids || [], false) });
+        out.push({ tag: "blockquote", children: blockTree(b.kids_ || [], false) });
         break;
       case "ul":
       case "ol": {
-        const items = (b.items || []).map((item): MarkdownNode => ({ tag: "li", children: blockTree(item, !!b.tight) }));
+        const items = (b.items_ || []).map((item): MarkdownNode => ({ tag: "li", children: blockTree(item, !!b.tight_) }));
         const list: MarkdownElement = { tag: b.t, children: items };
-        if (b.t === "ol" && b.start !== 1) list.start = b.start;
+        if (b.t === "ol" && b.start_ !== 1) list.start = b.start_;
         out.push(list);
         break;
       }
       case "table":
-        out.push(tableTree(b.rows || [], b.align || []));
+        out.push(tableTree(b.rows_ || [], b.align_ || []));
         break;
       case "hr":
         out.push({ tag: "hr" });
@@ -892,7 +892,7 @@ function tableTree(rows: string[][], align: (Align | "")[]): MarkdownElement {
 
 function inlineTree(n: Inl | null, out: MarkdownNode[], depth: number, inA: boolean): MarkdownNode[] {
   let run = "";
-  for (; n; n = n.next) {
+  for (; n; n = n.next_) {
     if (n.k === TEXT || n.k === DELIM) run += n.s;
     else if (n.k === NOTE) {
       // A link's destination stays a string of its own, unless that link was flattened into text.
@@ -900,17 +900,17 @@ function inlineTree(n: Inl | null, out: MarkdownNode[], depth: number, inA: bool
       pushText(out, run);
       pushText(out, n.s);
       run = "";
-    } else if (n.k === EL && ((n.s === "a" && inA) || depth >= MAX_INLINE)) run += plain(n.kid);
+    } else if (n.k === EL && ((n.s === "a" && inA) || depth >= MAX_INLINE)) run += plain(n.kid_);
     else {
       pushText(out, run);
       run = "";
       if (n.k === BR) out.push({ tag: "br" });
       else if (n.k === CODE) out.push({ tag: "code", children: [clean(n.s)] });
       else {
-        const el: MarkdownElement = { tag: n.s as Tag, children: inlineTree(n.kid, [], depth + 1, inA || n.s === "a") };
+        const el: MarkdownElement = { tag: n.s as Tag, children: inlineTree(n.kid_, [], depth + 1, inA || n.s === "a") };
         if (n.s === "a") {
-          el.href = n.href;
-          if (n.dest) el.dest = n.dest;
+          el.href = n.href_;
+          if (n.dest_) el.dest = n.dest_;
         }
         out.push(el);
       }

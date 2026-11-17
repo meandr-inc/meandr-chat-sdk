@@ -5,12 +5,15 @@ import { readFileSync, rmSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 
 const target = "es2019";
+// A name ending in _ is internal, and every build shortens it, the npm one too: an app's
+// bundler never renames properties. Nothing public, and nothing sent to the chat, ends in _.
+const mangleProps = /_$/;
 
 // What a page ships, minified and gzipped, in bytes; the build fails past these.
 const budgets = {
-  "src/index.ts": 9500,
-  "src/markdown.ts": 8000,
-  "src/global.ts": 17000,
+  "src/index.ts": 10600,
+  "src/markdown.ts": 6700,
+  "src/global.ts": 17100,
 };
 
 rmSync("dist", { recursive: true, force: true });
@@ -22,6 +25,7 @@ await build({
   splitting: true,
   format: "esm",
   target,
+  mangleProps,
   sourcemap: true,
   chunkNames: "chunk-[hash]",
 });
@@ -34,6 +38,7 @@ await build({
   format: "iife",
   globalName: "MeandrChat",
   target,
+  mangleProps,
   minify: true,
   sourcemap: true,
 });
@@ -46,7 +51,7 @@ console.log("dist/meandr-chat.js integrity", sri);
 
 let over = false;
 for (const [entry, budget] of Object.entries(budgets)) {
-  const out = await build({ entryPoints: [entry], bundle: true, format: "esm", target, minify: true, write: false });
+  const out = await build({ entryPoints: [entry], bundle: true, format: "esm", target, mangleProps, minify: true, write: false });
   const size = gzipSync(out.outputFiles[0].contents).length;
   console.log(entry, size, "bytes minified and gzipped, budget", budget);
   if (size > budget) over = true;

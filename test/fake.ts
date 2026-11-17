@@ -6,7 +6,23 @@ interface Message {
   role: "user" | "assistant";
   text: string;
   tools?: string[];
+  tool_titles?: Record<string, string>;
+  files?: FileJSON[];
   created_at: string;
+}
+
+export interface FileJSON {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  created_at: string;
+}
+
+interface Stored extends FileJSON {
+  owner: string;
+  bytes: Uint8Array;
+  taken: boolean;
 }
 
 // goText is what Go stores: lone surrogates as U+FFFD (JSON decoding), then strings.TrimSpace.
@@ -29,7 +45,7 @@ export function goText(s: string): string {
 
 export interface Turn {
   deltas?: string[];
-  tools?: Array<{ name: string; status: string }>;
+  tools?: Array<{ name: string; status: string; title?: string }>;
   text?: string;
   stop?: string;
   error?: { error: string; message?: string; partial?: boolean };
@@ -118,6 +134,14 @@ export class FakeChat {
   failViews = 0;
   startPrompt: string | null = null; // the app's CHAT_START_PROMPT; null refuses a start
   startNew = false; // CHAT_START_CONVERSATION new
+  attachments = true; // CHAT_ATTACHMENTS
+  fileTypes = TYPES.slice(); // the kinds switched on
+  maxFileBytes = 7 << 20; // CHAT_ATTACHMENT_MAX_MIB
+  perMessage = 5; // CHAT_ATTACHMENTS_PER_MESSAGE
+  storageBytes = 50 << 20; // CHAT_ATTACHMENT_STORAGE_MIB
+  saysFiles = true; // false plays a chat from before files, whose session says nothing of them
+  contextMax: number | null = 8 << 10; // CHAT_PAGE_CONTEXT_KIB; null plays a chat from before page context
+  files = new Map<string, Stored>();
   private n = 0;
   private msgId = 0;
 
@@ -125,7 +149,7 @@ export class FakeChat {
     const url = String(input);
     const headers = new Headers(init.headers);
     const method = (init.method || "GET").toUpperCase();
-    const body = typeof init.body === "string" && init.body !== "" ? JSON.parse(init.body) : undefined;
+    const body = typeof init.body === "string" && init.body !== "" ? JSON.parse(init.body) : (init.body ?? undefined);
     if (url.startsWith(TOKEN_URL)) {
       this.tokenCalls++;
       this.seen.push({ method, url, path: url, auth: headers.get("Authorization"), headers, body, init });
@@ -156,7 +180,7 @@ export class FakeChat {
     }
     if (method === "POST" && path === "/chat/v1/start") {
       const who = this.identify(bearer);
-      return "status" in who ? who : this.startTurn(who, !!(body && (body as { new?: boolean }).new), init.signal);
+      return "status" in who ? who : this.startTurn(who, (body || {}) as { new?: boolean; context?: unknown }, init.signal);
     }
     const m = /^\/chat\/v1\/conversations(?:\/([^/]+)(\/messages)?)?$/.exec(path);
     if (m) {
@@ -164,6 +188,17 @@ export class FakeChat {
       if ("status" in who) return who;
       if (method === "GET" && m[1] && !m[2]) return this.view(who, decodeURIComponent(m[1]));
       if (method === "POST" && (!m[1] || m[2])) return this.message(who, m[1] ? decodeURIComponent(m[1]) : null, body, init.signal);
+    }
+    const f = /^\/chat\/v1\/files(?:\/([^/?]+))?(?:\?(.*))?$/.exec(path);
+    if (f) {
+      const who = this.identify(bearer);
+      if ("status" in who) return who;
+      if (method === "POST" && !f[1]) {
+        if (!this.takes()) return json(403, { error: "attachments_off", message: "This chat takes no files." });
+        const name = new URLSearchParams(f[2] || "").get("name") || "";
+        return this.upload(who, name, headers.get("Content-Type") || "", body as Blob);
+      }
+      if (method === "GET" && f[1]) return this.download(who, decodeURIComponent(f[1]));
     }
     return json(404, { error: "not_found", message: "No such page." });
   };
@@ -259,8 +294,33 @@ export class FakeChat {
       messages: conv ? conv.messages.slice(-100) : [],
       answering: conv ? conv.answering > 0 || conv.pending !== null : false,
     };
+    if (this.saysFiles) {
+      out.files = this.takes() ? { types: this.fileTypes, max_bytes: this.maxFileBytes, per_message: this.perMessage } : null;
+    }
+    if (this.contextMax !== null) out.context_max_bytes = this.contextMax;
     if (sessionToken) out.session_token = sessionToken;
     return json(200, out);
+  }
+
+  private takes(): boolean {
+    return this.attachments && this.fileTypes.length > 0;
+  }
+
+  // pageContext refuses what server.go's pageContext does: no JSON object, past
+  // contextMax bytes as sent, or a url, title or timezone that isn't a short string.
+  private pageContext(v: unknown): Response | null {
+    if (v === undefined || v === null || this.contextMax === null) return null;
+    if (typeof v !== "object" || Array.isArray(v)) return json(400, { error: "bad_request", message: "The page's context isn't a JSON object." });
+    const size = (s: string) => new TextEncoder().encode(s).length;
+    if (size(JSON.stringify(v)) > this.contextMax) return json(413, { error: "too_large", message: "The page's context is too large." });
+    const o = v as Record<string, unknown>;
+    for (const [k, most] of [["url", 2048], ["title", 512], ["timezone", 64]] as const) {
+      const f = o[k];
+      if (f != null && (typeof f !== "string" || size(f) > most)) {
+        return json(400, { error: "bad_request", message: "The page's url, title and timezone must be short strings." });
+      }
+    }
+    return null;
   }
 
   private latest(who: Identity): Conv | undefined {
@@ -297,9 +357,20 @@ export class FakeChat {
     return json(200, { conversation: this.conversationJSON(c), messages: c.messages.slice(-100), answering });
   }
 
-  private message(who: Identity, id: string | null, body: { text?: unknown } | undefined, signal?: AbortSignal | null): Response {
+  private message(who: Identity, id: string | null, body: { text?: unknown; files?: unknown; context?: unknown } | undefined, signal?: AbortSignal | null): Response {
     const text = body && typeof body.text === "string" ? goText(body.text) : "";
-    if (!text) return json(400, { error: "bad_request", message: "The message is empty." });
+    const ids: unknown[] = body && Array.isArray(body.files) ? body.files : [];
+    if (ids.length && !this.takes()) return json(403, { error: "attachments_off", message: "This chat takes no files." });
+    if (!text && !ids.length) return json(400, { error: "bad_request", message: "The message is empty." });
+    const refused = this.pageContext(body && body.context);
+    if (refused) return refused;
+    if (ids.length > this.perMessage) return json(400, { error: "bad_request", message: "Too many files." });
+    const files: FileJSON[] = [];
+    for (const fid of ids) {
+      const s = typeof fid === "string" ? this.files.get(fid) : undefined;
+      if (!s || s.owner !== who.sub || s.taken) return json(400, { error: "bad_request", message: "No such file: " + String(fid) });
+      files.push(fileJSON(s));
+    }
     let c: Conv;
     if (id) {
       const o = this.owned(who, id);
@@ -312,6 +383,8 @@ export class FakeChat {
     if (running || Date.now() < this.busyUntil) return json(409, { error: "busy", message: "Still answering your previous message." });
     if (!id) this.convs.set(c.id, c);
     const user = this.msg("user", text);
+    if (files.length) user.files = files;
+    for (const fl of files) this.files.get(fl.id)!.taken = true;
     c.messages.push(user);
     if (this.internalAfterStore > 0) {
       this.internalAfterStore--;
@@ -343,6 +416,7 @@ export class FakeChat {
     }
     const stored = this.msg("assistant", answer);
     if (turn.tools) stored.tools = turn.tools.filter((t) => t.status === "started").map((t) => t.name);
+    for (const t of turn.tools || []) if (t.title) stored.tool_titles = { ...stored.tool_titles, [t.name]: t.title };
     c.messages.push(stored);
     parts.push(": keep-alive\n\n");
     parts.push(ev("done", { message: stored, stop: turn.stop || "end" }));
@@ -351,7 +425,10 @@ export class FakeChat {
 
   // startTurn has the assistant speak first, as server.go's pageStart: the
   // conversation first, never a message event, the start turn itself hidden.
-  private startTurn(who: Identity, fresh: boolean, signal?: AbortSignal | null): Response {
+  private startTurn(who: Identity, body: { new?: boolean; context?: unknown }, signal?: AbortSignal | null): Response {
+    const fresh = !!body.new;
+    const refused = this.pageContext(body.context);
+    if (refused) return refused;
     if (this.startPrompt === null) return json(403, { error: "start_not_allowed", message: "This chat doesn't start conversations itself." });
     const running = Array.from(this.convs.values()).some((x) => x.sub === who.sub && (x.answering > 0 || x.pending !== null));
     if (running || Date.now() < this.busyUntil) return json(409, { error: "busy", message: "Still answering your previous message." });
@@ -377,6 +454,137 @@ export class FakeChat {
     c.answering = turn.pollsAnswering === undefined ? 1 : turn.pollsAnswering;
     c.pending = answer;
   }
+
+  // upload keeps a file for its visitor's next message, its type read from its bytes.
+  private async upload(who: Identity, name: string, declared: string, file: Blob): Promise<Response> {
+    if (file.size > this.maxFileBytes) return json(413, { error: "too_large", message: "The file is too large." });
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const type = sniff(bytes, declared);
+    if (!type || this.fileTypes.indexOf(type) < 0) return json(415, { error: "unsupported_type", message: "The chat doesn't take this kind of file." });
+    let kept = 0;
+    for (const s of this.files.values()) if (s.owner === who.sub) kept += s.size;
+    if (kept + bytes.length > this.storageBytes) return json(403, { error: "storage_full", message: "Too many files kept." });
+    const s: Stored = { id: "f" + ++this.n, name: cleanName(name), type, size: bytes.length, created_at: "2026-11-17T00:00:00Z", owner: who.sub, bytes, taken: false };
+    this.files.set(s.id, s);
+    return json(201, fileJSON(s));
+  }
+
+  // download answers a file to its uploader alone: an image as itself, anything else to save.
+  private download(who: Identity, id: string): Response {
+    const s = this.files.get(id);
+    if (!s || s.owner !== who.sub) return json(404, { error: "not_found", message: "No such file." });
+    const image = s.type.startsWith("image/");
+    const headers: Record<string, string> = {
+      "Content-Type": image ? s.type : "application/octet-stream",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "no-store",
+    };
+    if (!image) headers["Content-Disposition"] = "attachment";
+    return new Response(s.bytes.slice(), { status: 200, headers });
+  }
+}
+
+export const TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif", "application/pdf", "text/plain", "text/markdown", "text/csv"];
+
+function fileJSON(s: Stored): FileJSON {
+  return { id: s.id, name: s.name, type: s.type, size: s.size, created_at: s.created_at };
+}
+
+// sniff reads a file's type as the chat does: an image's or a PDF's signature,
+// or else text, where a declared Markdown or CSV stands.
+function sniff(b: Uint8Array, declared: string): string | null {
+  const at = (sig: number[], from = 0) => sig.every((v, i) => b[from + i] === v);
+  if (at([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
+  if (at([0xff, 0xd8, 0xff])) return "image/jpeg";
+  if (at([0x47, 0x49, 0x46, 0x38])) return "image/gif";
+  if (at([0x52, 0x49, 0x46, 0x46]) && at([0x57, 0x45, 0x42, 0x50], 8)) return "image/webp";
+  if (at([0x25, 0x50, 0x44, 0x46, 0x2d])) return "application/pdf";
+  if (b.includes(0)) return null;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(b);
+  } catch {
+    return null;
+  }
+  const d = declared.split(";")[0].trim().toLowerCase();
+  return d === "text/markdown" || d === "text/csv" ? d : "text/plain";
+}
+
+// cleanName drops control characters and path separators, keeps 255 bytes, and names none "file".
+function cleanName(name: string): string {
+  let out = "";
+  for (const ch of name) {
+    const c = ch.charCodeAt(0);
+    if (c < 32 || c === 127 || ch === "/" || ch === "\\") continue;
+    if (new TextEncoder().encode(out + ch).length > 255) break;
+    out += ch;
+  }
+  return out || "file";
+}
+
+interface Progress {
+  loaded: number;
+  total: number;
+}
+
+// xhrOf plays XMLHttpRequest over fake.fetch: an upload reports its progress in
+// quarters, or, stalled, never moves.
+export function xhrOf(fake: FakeChat, stall = false) {
+  return class FakeXHR {
+    static sent: FakeXHR[] = [];
+    withCredentials = false;
+    status = 0;
+    responseText = "";
+    upload: { onprogress: ((e: Progress) => void) | null } = { onprogress: null };
+    onprogress: (() => void) | null = null;
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    aborted = false;
+    method = "";
+    url = "";
+    headers: Record<string, string> = {};
+    res: Response | null = null;
+
+    open(method: string, url: string): void {
+      this.method = method;
+      this.url = url;
+    }
+
+    setRequestHeader(name: string, value: string): void {
+      this.headers[name] = value;
+    }
+
+    getResponseHeader(name: string): string | null {
+      return this.res ? this.res.headers.get(name) : null;
+    }
+
+    abort(): void {
+      this.aborted = true;
+    }
+
+    send(body: Blob): void {
+      FakeXHR.sent.push(this);
+      if (!stall) void this.run(body);
+    }
+
+    async run(body: Blob): Promise<void> {
+      for (let q = 1; q <= 4; q++) {
+        await Promise.resolve();
+        if (this.aborted) return;
+        if (this.upload.onprogress) this.upload.onprogress({ loaded: Math.floor((body.size * q) / 4), total: body.size });
+      }
+      try {
+        const init: RequestInit = { method: this.method, headers: this.headers, body, credentials: this.withCredentials ? "include" : "same-origin" };
+        this.res = await fake.fetch(this.url, init);
+        this.responseText = await this.res.text();
+      } catch {
+        if (!this.aborted && this.onerror) this.onerror();
+        return;
+      }
+      if (this.aborted) return;
+      this.status = this.res.status;
+      if (this.onload) this.onload();
+    }
+  };
 }
 
 export function ev(name: string, data: unknown): string {
