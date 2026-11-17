@@ -11,8 +11,13 @@ import type {
   ChatOptions,
   ChatState,
   Conversation,
+  DeleteConversationResult,
   FileLimits,
+  ListConversationsOptions,
+  ListConversationsResult,
+  LoadOlderResult,
   Message,
+  OpenConversationResult,
   PageContext,
   ReadFileOptions,
   ReadFileResult,
@@ -31,15 +36,18 @@ interface Opened {
   started_: boolean;
   conversation: Conversation | null;
   messages: Message[];
+  more_: boolean; // older messages remain
   answering: boolean;
   sessionToken_: string | null;
   files: FileLimits | null | undefined; // undefined from a chat that doesn't say
   contextMax_: number | undefined;
+  list_: boolean; // the host lists conversations
 }
 
 interface View {
   conversation: Conversation;
   messages: Message[];
+  more_: boolean;
   answering: boolean;
 }
 
@@ -55,6 +63,13 @@ interface Sent {
   files: string[];
   target_: string | null;
   known_: number;
+}
+
+// Unnamed is a send or start out to start a conversation the chat hasn't named yet. Ended
+// by the page meanwhile, it goes on unseen while its session lasts, to end it once named.
+interface Unnamed {
+  session_: AbortSignal;
+  done_?: (end?: Promise<void>) => void; // endConversation's, settling its promise
 }
 
 const OPTIONS = ["url", "token", "tokenUrl", "getToken", "fetch", "context"];
@@ -87,6 +102,7 @@ const IDLE: ChatState = {
   anonymous: null,
   conversation: null,
   messages: [],
+  hasOlder: false,
   outgoing: null,
   answer: null,
   answering: false,
@@ -94,6 +110,7 @@ const IDLE: ChatState = {
   stop: null,
   error: null,
   files: null,
+  conversationList: null,
 };
 
 export function createChat(options: ChatOptions): Chat {
@@ -112,11 +129,16 @@ class Client implements Chat {
   private cookieless_ = false; // learned once: this browser doesn't keep the chat's cookie
   private opening_: Promise<ChatState> | null = null;
   private session_ = new AbortController(); // aborted by reopen, signOut and destroy
-  private conv_ = new AbortController(); // aborted with the session, and by newConversation
+  private conv_ = new AbortController(); // aborted with the session, and when the conversation shown is dropped
   private convVersion_ = 0;
-  private wantNew_ = false; // newConversation before the session opened
+  private hideNext_ = false; // openConversation before the session opened: it shows no conversation
+  private endNext_ = false; // endConversation before the session opened: it ends its conversation, and hides it
+  private ending_: Promise<void> | undefined; // the end the last open sent for endNext_
+  private moves_ = 0; // openConversation, send and start calls: an open outrun by one shows nothing
+  private unnamed_: Unnamed | null = null; // the send or start out to start a conversation, until the chat names it
   private sending_: object | null = null;
   private watcher_: AbortController | null = null;
+  private older_: { from_: Message; p_: Promise<LoadOlderResult> } | null = null; // loadOlder's request, for those before from_
   private unsure_: Sent | null = null; // a message the chat may have stored: sending it again checks first
   private maxSeen_ = 0; // message ids rise, so a newer message has a larger one
   private limits_: FileLimits | null | undefined; // as the last session said; undefined while unknown
@@ -204,11 +226,86 @@ class Client implements Chat {
 
   start = (): Promise<SendResult> => this.doStart_();
 
+  endConversation = (): Promise<void> => {
+    if (this.dead_) return Promise.resolve();
+    const c = this.state_.conversation;
+    const u = c ? null : this.unnamed_;
+    const opening = this.opening_;
+    if (this.state_.status !== "ready") this.endNext_ = true;
+    const named = u && new Promise<void>((resolve) => (u.done_ = resolve)); // before clear_: it detaches u
+    this.unnamed_ = null;
+    this.clear_();
+    if (c) return this.sendEnd_(c.id);
+    if (named) return named;
+    // Before the session opens, the conversation it opens on is ended then; an opening under way is awaited.
+    return opening ? opening.then((st) => (st.status === "ready" ? this.ending_ : undefined)) : Promise.resolve();
+  };
+
   newConversation = (): void => {
-    if (this.dead_) return;
-    if (this.state_.status !== "ready") this.wantNew_ = true;
-    this.dropConversation_();
-    this.set_({ conversation: null, messages: [], outgoing: null, answer: null, answering: false, waiting: null, stop: null, error: null });
+    void this.endConversation();
+  };
+
+  listConversations = (options?: ListConversationsOptions): Promise<ListConversationsResult> => {
+    const o = checked(options, ["before", "signal"]);
+    const path = "/conversations" + (o.before === undefined ? "" : "?before=" + encodeURIComponent(idOf(o.before)));
+    return this.flow_(o.signal, async (signal): Promise<ListConversationsResult> => {
+      if (this.state_.conversationList === false) throw listOff();
+      const v = (await readJSON(await this.retried_({ method: "GET", path }, signal), signal)) as Record<string, unknown> | null;
+      if (!v || !Array.isArray(v.conversations)) throw bad("list");
+      return { ok: true, conversations: v.conversations.map((c) => conversationOf(c, true)), hasMore: v.has_more === true };
+    });
+  };
+
+  openConversation = (conversation: Conversation | string): Promise<OpenConversationResult> => {
+    const id = idOf(conversation);
+    if (this.state_.status !== "ready") this.hideNext_ = true;
+    const move = ++this.moves_;
+    const version = this.convVersion_;
+    return this.flow_(this.conv_.signal, async (signal): Promise<OpenConversationResult> => {
+      const v = await this.page_(id, signal);
+      // A later open, a message or a start, or a new conversation since keeps what's shown.
+      if (move !== this.moves_ || version !== this.convVersion_) throw aborted();
+      this.dropConversation_();
+      this.seen_(v.messages);
+      this.set_({ ...this.shown_(v.conversation, v.messages, v.more_), outgoing: null, answer: null, answering: v.answering, waiting: null, stop: null, error: null });
+      if (v.answering) this.watch_(v.conversation.id);
+      return { ok: true, conversation: v.conversation };
+    });
+  };
+
+  deleteConversation = (conversation: Conversation | string): Promise<DeleteConversationResult> => {
+    const id = idOf(conversation);
+    return this.flow_(null, async (signal): Promise<DeleteConversationResult> => {
+      if (this.state_.conversationList === false) throw listOff();
+      try {
+        discard(await this.retried_({ method: "DELETE", path: "/conversations/" + encodeURIComponent(id) }, signal));
+      } catch (e) {
+        if (!isCode(e, "not_found")) throw e; // already gone
+      }
+      if (this.current_(id)) this.clear_();
+      return { ok: true };
+    });
+  };
+
+  loadOlder = (): Promise<LoadOlderResult> => {
+    const { conversation: c, messages, hasOlder } = this.state_;
+    const first = messages[0];
+    if (!c || !first || !hasOlder) return Promise.resolve({ ok: true, messages: [] });
+    const o = this.older_;
+    if (o && o.from_ === first) return o.p_;
+    const p = this.flow_(this.conv_.signal, async (signal): Promise<LoadOlderResult> => {
+      const v = await this.page_(c.id, signal, first.id);
+      const shown = this.state_.messages;
+      if (shown[0] !== first) throw aborted(); // another conversation, or the window read again
+      const older = v.messages.filter((m) => m.id < first.id);
+      this.set_({ messages: older.concat(shown), hasOlder: v.more_ && older.length > 0 });
+      return { ok: true, messages: older };
+    });
+    this.older_ = { from_: first, p_: p };
+    p.then(() => {
+      if (this.older_ && this.older_.p_ === p) this.older_ = null;
+    });
+    return p;
   };
 
   reopen = (options?: ReopenOptions): Promise<ChatState> => {
@@ -288,6 +385,21 @@ class Client implements Chat {
     this.unsure_ = null;
   }
 
+  // clear drops the conversation shown, with everything under way in it, and shows none.
+  private clear_(): void {
+    this.dropConversation_();
+    this.set_({ conversation: null, messages: [], hasOlder: false, outgoing: null, answer: null, answering: false, waiting: null, stop: null, error: null });
+  }
+
+  // land stops u being the page's unnamed request: it's named, refused or lost.
+  private land_(u: Unnamed | null | undefined): void {
+    if (u && this.unnamed_ === u) this.unnamed_ = null;
+  }
+
+  private detached_(u: Unnamed | null | undefined): u is Required<Unnamed> {
+    return !!u && !!u.done_ && !u.session_.aborted;
+  }
+
   private dropSession_(): void {
     this.session_.abort();
     this.session_ = new AbortController();
@@ -299,7 +411,7 @@ class Client implements Chat {
     this.dropSession_();
     this.auth_ = { kind_: "cookie" };
     this.who_ = null;
-    this.wantNew_ = false;
+    this.hideNext_ = this.endNext_ = false;
     this.maxSeen_ = 0;
     this.limits_ = this.contextMax_ = undefined;
     this.state_ = IDLE;
@@ -313,31 +425,44 @@ class Client implements Chat {
     this.watcher_ = null;
     this.convVersion_++;
     this.unsure_ = null;
-    this.wantNew_ = false;
+    this.hideNext_ = this.endNext_ = false;
     this.maxSeen_ = 0;
-    this.state_ = { ...IDLE, status: "ready", files: this.state_.files }; // the host's, not the user's
+    const s = this.state_;
+    this.state_ = { ...IDLE, status: "ready", files: s.files, conversationList: s.conversationList }; // the host's, not the user's
     this.show_(o, this.convVersion_, false);
   }
 
-  // show applies an opened session; hide keeps its conversation off the page,
-  // after newConversation, while still learning its newest message.
+  // show applies an opened session; hide keeps its conversation off the page, after
+  // endConversation or openConversation, while still learning its newest message.
   private show_(o: Opened, version: number, hide: boolean): void {
     this.seen_(o.messages);
     if (version !== this.convVersion_) {
       this.set_({ anonymous: o.anonymous });
       return;
     }
-    if (hide) {
-      this.set_({ anonymous: o.anonymous, conversation: null, messages: [], answering: false });
+    const c = o.conversation;
+    if (hide || !c) {
+      this.set_({ anonymous: o.anonymous, conversation: null, messages: [], hasOlder: false, answering: false });
       return;
     }
-    const answering = o.answering && o.conversation !== null;
-    this.set_({ anonymous: o.anonymous, conversation: o.conversation, messages: merge(this.state_.messages, o.messages), answering });
-    if (answering && o.conversation) this.watch_(o.conversation.id);
+    this.set_({ anonymous: o.anonymous, ...this.shown_(c, o.messages, o.more_), answering: o.answering });
+    if (o.answering) this.watch_(c.id);
   }
 
-  private forget_(id: string): void {
-    if (this.current_(id)) this.set_({ conversation: null, messages: [], answer: null, answering: false });
+  // shown is what a read of c's last messages shows. The conversation shown keeps the
+  // older ones it loaded, and hasOlder, when the read reaches back to what it shows.
+  private shown_(c: Conversation, fresh: Message[], more: boolean): Partial<ChatState> {
+    const old = this.state_.messages;
+    const at = this.current_(c.id) && fresh.length ? old.findIndex((m) => m.id === fresh[0].id) : -1;
+    const messages = merge(old, fresh);
+    return at < 0 ? { conversation: c, messages, hasOlder: more } : { conversation: c, messages: old.slice(0, at).concat(messages) };
+  }
+
+  // forget stops showing conversation id when e says it's missing: ended in another tab
+  // where the chat lists none, or deleted. It answers e, to throw.
+  private forget_(id: string, e: unknown): unknown {
+    if (isCode(e, "not_found") && this.current_(id)) this.set_({ conversation: null, messages: [], hasOlder: false, answer: null, answering: false });
+    return e;
   }
 
   // --- opening
@@ -351,10 +476,12 @@ class Client implements Chat {
       try {
         const o = await this.establish_(session.signal);
         if (session.signal.aborted) return this.state_;
-        const hidden = this.wantNew_;
-        this.wantNew_ = false;
-        this.show_(o, version, hidden);
+        const end = this.endNext_;
+        const hide = end || this.hideNext_;
+        this.hideNext_ = this.endNext_ = false;
+        this.show_(o, version, hide);
         this.set_({ status: "ready", waiting: null });
+        this.ending_ = end && o.conversation ? this.sendEnd_(o.conversation.id) : undefined;
         return this.state_;
       } catch (e) {
         if (session.signal.aborted) return this.state_;
@@ -452,11 +579,13 @@ class Client implements Chat {
     if (!res.ok) throw await failure(res, signal);
     const o = openedOf(await readJSON(res, signal));
     live(signal);
-    // Every session says what the host takes; an unchanged answer keeps the state's object.
+    // Every session says what the host takes, and whether it lists conversations;
+    // an unchanged answer keeps the state's object.
     this.limits_ = o.files;
     this.contextMax_ = o.contextMax_;
     const files = o.files || null;
     if (JSON.stringify(files) !== JSON.stringify(this.state_.files)) this.set_({ files });
+    if (o.list_ !== this.state_.conversationList) this.set_({ conversationList: o.list_ });
     return o;
   }
 
@@ -506,12 +635,14 @@ class Client implements Chat {
     return this.auth_.kind_ === "cookie" ? null : this.auth_.token();
   }
 
-  // authed makes a request as the session's user; a lapsed token or session is
-  // renewed or reopened once, for target's conversation.
-  private async authed_(c: Omit<Call, "bearer" | "signal">, signal: AbortSignal, target: string | null): Promise<Response> {
+  // authed makes a request as the session's user; a lapsed token or session is renewed or
+  // reopened once, for target's conversation. u, a request starting one, is unnamed while out.
+  private async authed_(c: Omit<Call, "bearer" | "signal">, signal: AbortSignal, target: string | null, u?: Unnamed | null): Promise<Response> {
     for (let retried = false; ; retried = true) {
+      if (u) this.unnamed_ = u;
       const res = await request(this.fetchFn_, this.base_, { ...c, bearer: this.bearer_(), signal });
-      if (res.status !== 401 || retried) return res;
+      if (res.status !== 401 || retried || (u && u.done_)) return res;
+      this.land_(u);
       const err = await failure(res, signal);
       if (!(await this.recoverAuth_(err, signal, target))) throw err;
     }
@@ -555,8 +686,8 @@ class Client implements Chat {
 
   // --- files
 
-  // flow runs attach's or readFile's request as the session's user, opening it
-  // as send does. The page's signal or the session's end cuts it short.
+  // flow runs a member's request as the session's user, opening it as send
+  // does. The page's signal or the session's end cuts it short.
   private async flow_<T>(signal: AbortSignal | null | undefined, run: (signal: AbortSignal) => Promise<T>): Promise<T | { ok: false; error: ChatError }> {
     if (this.dead_) return { ok: false, error: aborted() };
     const ctrl = new AbortController();
@@ -599,6 +730,35 @@ class Client implements Chat {
       const wait = waitFor(err);
       if (wait === null || Date.now() + wait > until) throw err;
       await sleep(wait, signal);
+    }
+  }
+
+  // sendEnd ends conversation id, trying again through about a minute while the chat can't be
+  // reached or asks to wait. A request under way outlives the page and the session; no retry does.
+  private async sendEnd_(id: string): Promise<void> {
+    const session = this.session_.signal;
+    const until = Date.now() + WAIT_CAP_MS;
+    const path = "/conversations/" + encodeURIComponent(id) + "/end";
+    for (let tries = 0, renewed = false; ; tries++) {
+      let err: ChatError;
+      try {
+        const res = await request(this.fetchFn_, this.base_, { method: "POST", path, bearer: this.bearer_(), keepalive: true });
+        if (res.ok || res.status === 404) return discard(res);
+        err = await failure(res);
+        if (res.status === 401 && !renewed && !session.aborted) {
+          renewed = true;
+          if (await this.recoverAuth_(err, session, id)) continue;
+        }
+      } catch (e) {
+        err = asChatError(e);
+      }
+      const wait = TRANSIENT.indexOf(err.code) < 0 ? null : openWait(err, tries, 0);
+      if (wait === null || Date.now() + wait > until) return;
+      try {
+        await sleep(wait, session);
+      } catch {
+        return;
+      }
     }
   }
 
@@ -651,6 +811,7 @@ class Client implements Chat {
     if (this.sending_ || this.state_.answering) return { ok: false, error: busy() };
     const mine = {};
     this.sending_ = mine;
+    this.moves_++;
     const scope = this.conv_;
     const u = this.unsure_;
     const recheck = u && u.text === text && String(u.files) === String(files) ? u : null;
@@ -667,7 +828,7 @@ class Client implements Chat {
       const context = await this.contextOf_(scope.signal);
       began = this.convVersion_;
       this.set_({ answering: true, answer: { text: "", tools: [] } });
-      const r = await this.deliver_(text, files, context, scope.signal, recheck);
+      const r = await cut(this.deliver_(text, files, context, scope.signal, recheck), scope.signal);
       return { ok: true, message: r.message, stop: r.stop };
     } catch (e) {
       return this.failed_(mine, scope, asChatError(e), began);
@@ -683,6 +844,7 @@ class Client implements Chat {
     if (this.sending_ || this.state_.answering) return { ok: false, error: busy() };
     const mine = {};
     this.sending_ = mine;
+    this.moves_++;
     const scope = this.conv_;
     let began = -1;
     this.set_({ error: null, stop: null });
@@ -696,7 +858,7 @@ class Client implements Chat {
       const context = await this.contextOf_(scope.signal);
       began = this.convVersion_;
       this.set_({ answering: true, answer: { text: "", tools: [] } });
-      const r = await this.begin_(scope.signal, context);
+      const r = await cut(this.begin_(scope.signal, context), scope.signal);
       return { ok: true, message: r.message, stop: r.stop };
     } catch (e) {
       return this.failed_(mine, scope, asChatError(e), began);
@@ -710,19 +872,23 @@ class Client implements Chat {
   // conversation shown, after newConversation say, it asks for a new one.
   private async begin_(signal: AbortSignal, context: object | undefined): Promise<Reply> {
     const sent: Sent = { text: "", files: [], target_: null, known_: this.maxSeen_ };
-    const body = this.state_.conversation === null ? { new: true, context } : { context };
-    const call: Omit<Call, "bearer" | "signal"> = { method: "POST", path: "/start", body, stream: true };
+    const fresh = this.state_.conversation === null;
+    const call: Omit<Call, "bearer" | "signal"> = { method: "POST", path: "/start", body: fresh ? { new: true, context } : { context }, stream: true };
     const waitUntil = Date.now() + WAIT_CAP_MS;
     const busyUntil = Date.now() + BUSY_CAP_MS;
     for (let busyTries = 0; ; ) {
       const stream = new AbortController();
-      const stop = () => stream.abort();
+      const u: Unnamed | null = fresh ? { session_: this.session_.signal } : null;
+      const stop = () => {
+        if (!this.detached_(u)) stream.abort();
+      };
       signal.addEventListener("abort", stop);
       try {
         let res: Response;
         try {
-          res = await this.authed_(call, stream.signal, null);
+          res = await this.authed_(call, stream.signal, null, u);
         } catch (e) {
+          this.land_(u);
           if (signal.aborted) throw aborted();
           const reopen = isChatError(e) ? waitFor(e) : null;
           if (reopen !== null && Date.now() + reopen <= waitUntil) {
@@ -731,7 +897,8 @@ class Client implements Chat {
           }
           throw e;
         }
-        if (res.ok) return await this.read_(res, stream, signal, sent);
+        if (res.ok) return await this.read_(res, stream, signal, sent, u);
+        this.land_(u);
         const err = await failure(res, signal);
         const wait = waitFor(err);
         if (wait !== null && Date.now() + wait <= waitUntil) {
@@ -745,6 +912,8 @@ class Client implements Chat {
         throw err;
       } finally {
         signal.removeEventListener("abort", stop);
+        this.land_(u);
+        if (u && u.done_) u.done_();
       }
     }
   }
@@ -774,13 +943,17 @@ class Client implements Chat {
     const busyUntil = Date.now() + BUSY_CAP_MS;
     for (let busyTries = 0; ; ) {
       const stream = new AbortController();
-      const stop = () => stream.abort();
+      const u: Unnamed | null = sent.target_ === null ? { session_: this.session_.signal } : null;
+      const stop = () => {
+        if (!this.detached_(u)) stream.abort();
+      };
       signal.addEventListener("abort", stop);
       try {
         let res: Response;
         try {
-          res = await this.authed_({ method: "POST", path, body: files.length ? { text, files, context } : { text, context }, stream: true }, stream.signal, sent.target_);
+          res = await this.authed_({ method: "POST", path, body: files.length ? { text, files, context } : { text, context }, stream: true }, stream.signal, sent.target_, u);
         } catch (e) {
+          this.land_(u);
           if (signal.aborted) throw aborted();
           if (isCode(e, "network")) return await this.ifLanded_(e as ChatError, sent, signal);
           // Opening the session again was refused before the message was sent: waiting is safe.
@@ -791,10 +964,11 @@ class Client implements Chat {
           }
           throw e;
         }
-        if (res.ok) return await this.read_(res, stream, signal, sent);
+        if (res.ok) return await this.read_(res, stream, signal, sent, u);
+        this.land_(u);
         const err = await failure(res, signal);
         if (err.code === "internal") return await this.ifLanded_(err, sent, signal);
-        if (err.code === "not_found" && sent.target_ !== null) this.forget_(sent.target_);
+        if (sent.target_ !== null) this.forget_(sent.target_, err);
         const wait = waitFor(err);
         if (wait !== null && Date.now() + wait <= waitUntil) {
           await this.pause_(err.code, wait, signal);
@@ -807,6 +981,8 @@ class Client implements Chat {
         throw err;
       } finally {
         signal.removeEventListener("abort", stop);
+        this.land_(u);
+        if (u && u.done_) u.done_();
       }
     }
   }
@@ -856,20 +1032,20 @@ class Client implements Chat {
   // stored it, and shows it. A new conversation holds nothing older than known.
   private async landed_(sent: Sent, signal: AbortSignal): Promise<string | null> {
     const mine = (m: Message) => isSent(m, sent);
-    let found: { conversation: Conversation; messages: Message[] } | null = null;
+    let found: { conversation: Conversation; messages: Message[]; more_: boolean } | null = null;
     if (sent.target_ !== null) {
       const v = await this.view_(sent.target_, signal);
       if (v.messages.some(mine)) found = v;
     } else {
       const o = await this.latest_(signal);
       if (o.conversation && o.messages.some(mine) && o.messages.every((m) => m.id > sent.known_)) {
-        found = { conversation: o.conversation, messages: o.messages };
+        found = { conversation: o.conversation, messages: o.messages, more_: o.more_ };
       }
     }
     live(signal);
     if (!found) return null;
     this.seen_(found.messages);
-    this.set_({ conversation: found.conversation, messages: merge(this.state_.messages, found.messages), outgoing: null });
+    this.set_({ ...this.shown_(found.conversation, found.messages, found.more_), outgoing: null });
     return found.conversation.id;
   }
 
@@ -900,7 +1076,7 @@ class Client implements Chat {
 
   // read applies the stream's events. A stream that ends without done or error
   // lost the answer, which runs on and is stored, so the conversation is followed.
-  private async read_(res: Response, stream: AbortController, signal: AbortSignal, sent: Sent): Promise<Reply> {
+  private async read_(res: Response, stream: AbortController, signal: AbortSignal, sent: Sent, u: Unnamed | null): Promise<Reply> {
     let conversation = sent.target_;
     let message = false;
     const reader = res.body ? res.body.getReader() : null;
@@ -917,20 +1093,27 @@ class Client implements Chat {
       try {
         for (;;) {
           const { value, done } = await reader.read();
-          if (signal.aborted) throw aborted();
+          if (signal.aborted && !this.detached_(u)) throw aborted();
           if (done) break;
           clearTimeout(stall);
           stall = setTimeout(() => stream.abort(), STALL_MS);
           this.batching_ = true;
           try {
             for (const ev of parser.push(decoder.decode(value, { stream: true }))) {
+              // Ended before the chat named it: end the conversation it names, and read no further.
+              if (this.detached_(u)) {
+                if (ev.event !== "conversation") continue;
+                u.done_(this.sendEnd_(conversationOf(JSON.parse(ev.data)).id));
+                throw aborted();
+              }
               if (signal.aborted) throw aborted();
               if (ev.event === "message" && message) continue;
               if (ev.event === "message") message = true;
               const out = this.event_(ev.event, ev.data);
               if (!out) continue;
-              if ("conversation" in out) conversation = out.conversation;
-              else return out;
+              if (!("conversation" in out)) return out;
+              conversation = out.conversation;
+              this.land_(u);
             }
           } finally {
             this.batching_ = false;
@@ -969,14 +1152,15 @@ class Client implements Chat {
       case "conversation": {
         const c = conversationOf(o);
         // A start that goes on in the conversation shown keeps its messages.
-        if (this.state_.conversation && this.state_.conversation.id === c.id) this.set_({ conversation: c });
-        else this.set_({ conversation: c, messages: [] });
+        this.set_(this.current_(c.id) ? { conversation: c } : { conversation: c, messages: [], hasOlder: false });
         return { conversation: c.id };
       }
       case "message": {
         const m = messageOf(o);
+        const c = this.state_.conversation;
         this.seen_([m]);
         this.set_({ messages: withMessage(this.state_.messages, m), outgoing: null });
+        if (c && c.endedAt) this.set_({ conversation: { ...c, endedAt: null } }); // the user's message reopens it
         return null;
       }
       case "delta": {
@@ -1044,8 +1228,19 @@ class Client implements Chat {
 
   private async view_(id: string, signal: AbortSignal): Promise<View> {
     const res = await this.authed_({ method: "GET", path: "/conversations/" + encodeURIComponent(id) }, signal, id);
-    if (!res.ok) throw await failure(res, signal);
+    if (!res.ok) throw this.forget_(id, await failure(res, signal));
     return viewOf(await readJSON(res, signal));
+  }
+
+  // page reads a conversation's last 20 messages, or the 20 before message before,
+  // waiting as the chat says.
+  private async page_(id: string, signal: AbortSignal, before?: number): Promise<View> {
+    const path = "/conversations/" + encodeURIComponent(id) + (before ? "?before=" + before : "");
+    try {
+      return viewOf(await readJSON(await this.retried_({ method: "GET", path }, signal), signal));
+    } catch (e) {
+      throw this.forget_(id, e);
+    }
   }
 
   // poll asks for the conversation every few seconds until no answer is being
@@ -1063,8 +1258,7 @@ class Client implements Chat {
       } catch (e) {
         if (signal.aborted) throw aborted();
         const err = asChatError(e);
-        if (err.code === "not_found") this.forget_(id);
-        else if (TRANSIENT.indexOf(err.code) >= 0 && ++failures < POLL_FAILURES) continue;
+        if (TRANSIENT.indexOf(err.code) >= 0 && ++failures < POLL_FAILURES) continue;
         throw err;
       }
       failures = 0;
@@ -1072,7 +1266,7 @@ class Client implements Chat {
       if (v.answering) continue;
       if (this.current_(id)) {
         this.seen_(v.messages);
-        this.set_({ conversation: v.conversation, messages: merge(this.state_.messages, v.messages), answering: false });
+        this.set_({ ...this.shown_(v.conversation, v.messages, v.more_), answering: false });
       }
       return v;
     }
@@ -1121,6 +1315,10 @@ function busy(): ChatError {
   return new ChatError("busy", "Still answering.");
 }
 
+function listOff(): ChatError {
+  return new ChatError("conversation_list_off", "This chat lists no conversations.");
+}
+
 function unopened(): ChatError {
   return new ChatError("unauthorized", "The chat couldn't be opened.");
 }
@@ -1135,9 +1333,9 @@ function checked<T extends object>(o: T | undefined, keys: string[]): T {
   return o;
 }
 
-function idOf(f: ChatFile | string): string {
+function idOf(f: { id: string } | string): string {
   const id = typeof f === "string" ? f : f && f.id;
-  if (typeof id !== "string" || id === "") throw new TypeError("a file is a ChatFile or its id");
+  if (typeof id !== "string" || id === "") throw new TypeError("expected a ChatFile or Conversation, or its id");
   return id;
 }
 
@@ -1178,6 +1376,15 @@ function notForThisChat(origin: string): ChatError {
 // live stops a flow its page has moved on from, before it writes anything down.
 function live(signal: AbortSignal): void {
   if (signal.aborted) throw aborted();
+}
+
+// cut settles as p does, or as aborted once signal aborts, leaving p to run on.
+function cut<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const stop = () => reject(aborted());
+    signal.addEventListener("abort", stop, { once: true });
+    p.then(resolve, reject).then(() => signal.removeEventListener("abort", stop));
+  });
 }
 
 function isCode(e: unknown, code: string): boolean {
@@ -1261,10 +1468,18 @@ function bad(what: string): ChatError {
   return new ChatError("protocol", "Unreadable " + what + " from the chat.");
 }
 
-function conversationOf(v: unknown): Conversation {
+function conversationOf(v: unknown, titled?: boolean): Conversation {
   const o = v as Record<string, unknown> | null;
   if (!o || typeof o !== "object" || typeof o.id !== "string") throw bad("conversation");
-  return { id: o.id, createdAt: String(o.created_at ?? ""), updatedAt: String(o.updated_at ?? "") };
+  const ended = o.ended_at;
+  const c: Conversation = {
+    id: o.id,
+    createdAt: String(o.created_at ?? ""),
+    updatedAt: String(o.updated_at ?? ""),
+    endedAt: typeof ended === "string" && ended ? ended : null,
+  };
+  if (titled) c.title = String(o.title ?? "");
+  return c;
 }
 
 function messageOf(v: unknown): Message {
@@ -1310,10 +1525,12 @@ function openedOf(v: unknown): Opened {
     started_: o.started === true,
     conversation: o.conversation ? conversationOf(o.conversation) : null,
     messages: messagesOf(o.messages),
+    more_: o.has_more === true,
     answering: o.answering === true,
     sessionToken_: typeof o.session_token === "string" && o.session_token !== "" ? o.session_token : null,
     files: limitsOf(o.files),
     contextMax_: typeof o.context_max_bytes === "number" ? o.context_max_bytes : undefined,
+    list_: o.conversation_list === true,
   };
 }
 
@@ -1329,5 +1546,5 @@ function limitsOf(v: unknown): FileLimits | null | undefined {
 function viewOf(v: unknown): View {
   const o = v as Record<string, unknown> | null;
   if (!o || typeof o !== "object") throw bad("conversation");
-  return { conversation: conversationOf(o.conversation), messages: messagesOf(o.messages), answering: o.answering === true };
+  return { conversation: conversationOf(o.conversation), messages: messagesOf(o.messages), more_: o.has_more === true, answering: o.answering === true };
 }

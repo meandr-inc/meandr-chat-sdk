@@ -2,7 +2,7 @@ import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatError, createChat, isChatError } from "../src/index";
 import { claimsOf } from "../src/token";
-import type { AttachResult, ChatFile, ChatOptions, ChatState, PageContext, ReadFileResult, SendResult } from "../src/types";
+import type { AttachResult, Chat, ChatFile, ChatOptions, ChatState, PageContext, ReadFileResult, SendResult } from "../src/types";
 import { ALICE, BOB, FakeChat, ORIGIN, TOKEN_URL, TYPES, ev, json, jwt, xhrOf } from "./fake";
 
 function setup(opts: Partial<ChatOptions> = {}, fake = new FakeChat()) {
@@ -590,24 +590,28 @@ describe("messages", () => {
     expect(chat.getState().messages.map((m) => m.text)).toEqual(["three", "Hello"]);
   });
 
-  it("starts a new conversation after newConversation", async () => {
+  it("ends the conversation shown on newConversation, and starts a new one with the next message", async () => {
     const { chat, fake } = setup({ token: ALICE });
     ok(await chat.send("one"));
+    const first = chat.getState().conversation!.id;
     chat.newConversation();
     expect(chat.getState().conversation).toBeNull();
     expect(chat.getState().messages).toEqual([]);
+    expect(fake.requests("POST", "/chat/v1/conversations/" + first + "/end")[0].init.keepalive).toBe(true);
     ok(await chat.send("two"));
     expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(2);
+    expect(fake.convs.get(first)!.ended).not.toBeNull();
   });
 
-  it("opens with no conversation after newConversation before opening", async () => {
+  it("opens with no conversation after newConversation before opening, ending the one it would show", async () => {
     const fake = new FakeChat();
-    fake.conversation("alice", "", ["old"]);
+    const old = fake.conversation("alice", "", ["old"]);
     const { chat } = setup({ token: ALICE }, fake);
     chat.newConversation();
     const st = await chat.open();
     expect(st.conversation).toBeNull();
     expect(st.messages).toEqual([]);
+    expect(old.ended).not.toBeNull();
     ok(await chat.send("new"));
     expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(1);
   });
@@ -1147,13 +1151,14 @@ describe("guards", () => {
         const res = await fake.fetch(u, i);
         if (!(String(u).endsWith("/session") && i?.method === "POST")) return res;
         const bytes = new Uint8Array(await res.arrayBuffer());
+        const step = Math.ceil(bytes.length / 20); // 20 parts 5 s apart: past 30 s, within the body's 180 s
         let at = 0;
         const body = new ReadableStream<Uint8Array>({
           pull: (c) =>
             new Promise<void>((r) =>
               setTimeout(() => {
                 if (at >= bytes.length) c.close();
-                else c.enqueue(bytes.slice(at, (at += 8)));
+                else c.enqueue(bytes.slice(at, (at += step)));
                 r();
               }, 5000),
             ),
@@ -1383,11 +1388,14 @@ describe("the client", () => {
 
   it("works with its members passed around unbound", async () => {
     const { chat } = setup({ token: ALICE });
-    const { open, send, getState, subscribe, newConversation } = chat;
+    const { open, send, getState, subscribe, newConversation, endConversation } = chat;
     subscribe(() => {});
     await open();
     ok(await send("q"));
     newConversation();
+    expect(getState().messages).toEqual([]);
+    ok(await send("r"));
+    await endConversation();
     expect(getState().messages).toEqual([]);
   });
 
@@ -1443,7 +1451,7 @@ describe("the assistant speaking first", () => {
     }
   });
 
-  it("goes on in the conversation shown, keeping its messages, or opens a new one when the chat says so", async () => {
+  it("goes on in the conversation shown, keeping its messages, or in a newer one another tab moved on to", async () => {
     const fake = new FakeChat();
     fake.startPrompt = "Say what needs attention.";
     const { chat } = setup({ token: ALICE }, fake);
@@ -1453,9 +1461,9 @@ describe("the assistant speaking first", () => {
     ok(await chat.start());
     expect(chat.getState().conversation!.id).toBe(conv);
     expect(chat.getState().messages.map((m) => m.text)).toEqual(["q", "Hello", "Nothing does"]);
-    fake.startNew = true;
+    const other = fake.conversation("alice", "", ["elsewhere"]);
     ok(await chat.start());
-    expect(chat.getState().conversation!.id).not.toBe(conv);
+    expect(chat.getState().conversation!.id).toBe(other.id);
     expect(chat.getState().messages.map((m) => m.text)).toEqual(["Hello"]);
   });
 
@@ -1715,14 +1723,15 @@ describe("files", () => {
     expect(chat.getState().files).toBeNull();
   });
 
-  it("keeps what the chat takes when the page is wiped for another user", async () => {
+  it("keeps what the chat takes, and whether it lists conversations, when the page is wiped for another user", async () => {
     const fake = new FakeChat();
+    fake.conversationList = true;
     const { chat } = setup({ tokenUrl: TOKEN_URL }, fake);
     await chat.open();
     for (const s of fake.sessions.values()) s.alive = false;
     fake.tokenAnswers.push({ status: 200, body: { token: BOB } });
     expect(err(await chat.send("alice's draft")).code).toBe("session_expired");
-    expect(chat.getState()).toMatchObject({ messages: [], outgoing: null, files: { maxBytes: 7 << 20 } });
+    expect(chat.getState()).toMatchObject({ messages: [], outgoing: null, files: { maxBytes: 7 << 20 }, conversationList: true });
   });
 
   it("refuses a file past the chat's most without sending it, once its session says", async () => {
@@ -2013,5 +2022,769 @@ describe("files", () => {
     const st = await chat.open();
     expect(st.messages[0].files).toEqual([{ id: "f9", name: "cat.png", type: "image/png", size: 3, createdAt: "2026-11-17T00:00:00Z" }]);
     expect(st.messages[1].files).toBeUndefined();
+  });
+});
+
+describe("conversations", () => {
+  const texts = (n: number, p = "m") => Array.from({ length: n }, (_, i) => p + (i + 1));
+  const shown = (chat: Chat) => chat.getState().messages.map((m) => m.text);
+  const older = (fake: FakeChat) => fake.requests("GET").filter((s) => s.path.includes("?before=")).map((s) => s.path);
+  const AT = "2026-11-15T00:00:00Z";
+
+  async function done<T extends { ok: boolean }>(p: Promise<T>): Promise<Extract<T, { ok: true }>> {
+    const r = await p;
+    if (!r.ok) throw (r as { error?: unknown }).error;
+    return r as Extract<T, { ok: true }>;
+  }
+
+  async function fails(p: Promise<{ ok: boolean; error?: ChatError }>): Promise<ChatError> {
+    const r = await p;
+    if (r.ok || !r.error) throw new Error("expected a failure");
+    return r.error;
+  }
+
+  // gated holds the first POST to path, its answer or only its body, until release is called.
+  function gated(fake: FakeChat, path: RegExp, part: "answer" | "body") {
+    let release = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    let held = false;
+    const fetch = async (u: RequestInfo | URL, i?: RequestInit): Promise<Response> => {
+      const res = await fake.fetch(u, i);
+      if (held || i?.method !== "POST" || !path.test(String(u))) return res;
+      held = true;
+      if (part === "answer") return gate.then(() => res);
+      const reader = res.body!.getReader();
+      const body = new ReadableStream<Uint8Array>({
+        pull: async (c) => {
+          await gate;
+          const r = await reader.read();
+          if (r.done) c.close();
+          else c.enqueue(r.value);
+        },
+        cancel: (why) => reader.cancel(why),
+      });
+      return new Response(body, { status: res.status, headers: res.headers });
+    };
+    return { fetch, release: () => release() };
+  }
+
+  it("opens on the latest conversation's last 20 messages, saying whether older ones remain and whether the chat lists conversations", async () => {
+    const fake = new FakeChat();
+    const c = fake.conversation("alice", "", texts(25));
+    const { chat } = setup({ tokenUrl: TOKEN_URL }, fake);
+    expect(chat.getState()).toMatchObject({ hasOlder: false, conversationList: null });
+    const st = await chat.open();
+    expect(st.messages.map((m) => m.text)).toEqual(texts(25).slice(5));
+    expect(st).toMatchObject({ hasOlder: true, conversationList: false });
+    fake.conversationList = true;
+    expect(await chat.reopen()).toMatchObject({ hasOlder: true, conversationList: true });
+    fake.conversationList = null; // a chat from before the list says nothing of it
+    expect((await chat.reopen()).conversationList).toBe(false);
+    c.messages.splice(0, 5);
+    expect((await chat.reopen()).hasOlder).toBe(false);
+    fake.add(c, texts(3, "x"));
+    expect((await chat.reopen()).hasOlder).toBe(true);
+    chat.newConversation();
+    expect(chat.getState()).toMatchObject({ conversation: null, hasOlder: false });
+    await chat.signOut();
+    expect(chat.getState()).toMatchObject({ hasOlder: false, conversationList: null });
+  });
+
+  it("lists the user's conversations a page at a time, most recently active first, with their titles, changing nothing in the state", async () => {
+    const fake = new FakeChat();
+    fake.conversationList = true;
+    const convs = texts(25).map((t) => fake.conversation("alice", "", ["  Where\n\n is " + t + "?  ", "Here."]));
+    fake.conversation("bob", "", ["bob's"]);
+    const { chat, states } = setup({ token: ALICE }, fake);
+    await chat.open();
+    const n = states.length;
+    const first = await done(chat.listConversations());
+    expect(first.hasMore).toBe(true);
+    expect(first.conversations.map((c) => c.id)).toEqual(convs.slice(5).reverse().map((c) => c.id));
+    expect(first.conversations[0]).toEqual({ id: convs[24].id, createdAt: AT, updatedAt: AT, endedAt: null, title: "Where is m25?" });
+    const rest = await done(chat.listConversations({ before: first.conversations[19] }));
+    expect(rest.hasMore).toBe(false);
+    expect(rest.conversations.map((c) => c.id)).toEqual(convs.slice(0, 5).reverse().map((c) => c.id));
+    expect((await done(chat.listConversations({ before: convs[5].id }))).conversations).toEqual(rest.conversations);
+    const base = "/chat/v1/conversations";
+    const lists = fake.requests("GET").filter((s) => s.path === base || s.path.startsWith(base + "?"));
+    expect(lists.map((s) => s.path)).toEqual([base, base + "?before=" + convs[5].id, base + "?before=" + convs[5].id]);
+    expect(states).toHaveLength(n);
+    expect(chat.getState().conversation!.id).toBe(convs[24].id);
+  });
+
+  it("opens the session first when needed, and lists as the session's user", async () => {
+    for (const keepsCookie of [true, false]) {
+      const fake = new FakeChat();
+      fake.conversationList = true;
+      fake.keepsCookie = keepsCookie;
+      fake.conversation("alice", "", ["hi"]);
+      const { chat } = setup({ token: ALICE }, fake);
+      expect((await done(chat.listConversations())).conversations.map((c) => c.title)).toEqual(["hi"]);
+      expect(chat.getState().status).toBe("ready");
+      expect(fake.requests("GET", "/chat/v1/conversations")[0].auth).toBe(keepsCookie ? null : "Bearer " + ALICE);
+    }
+  });
+
+  it("refuses a list where the chat keeps none: without a request once its session says so, or as the chat says", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    expect(await fails(chat.listConversations())).toMatchObject({ code: "conversation_list_off", status: 0, retryable: false });
+    expect(fake.requests("GET", "/chat/v1/conversations")).toHaveLength(0);
+    expect(chat.getState().status).toBe("ready");
+    fake.conversationList = true;
+    await chat.reopen({ token: ALICE });
+    fake.conversationList = false; // turned off since the session said
+    expect(await fails(chat.listConversations())).toMatchObject({ code: "conversation_list_off", status: 403 });
+    expect(chat.getState().conversationList).toBe(true);
+    fake.conversationList = true;
+    const hers = fake.conversation("bob", "", ["hers"]);
+    expect(await fails(chat.listConversations({ before: hers.id }))).toMatchObject({ code: "not_found", status: 404 });
+  });
+
+  it("checks the arguments of listConversations, openConversation and deleteConversation, changing nothing", async () => {
+    const fake = new FakeChat();
+    fake.conversation("alice", "", ["hi"]);
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    const n = fake.seen.length;
+    expect(() => chat.listConversations(null as never)).toThrow(TypeError);
+    expect(() => chat.listConversations({ befor: "c1" } as never)).toThrow(/unknown option befor/);
+    for (const before of [null, 1, "", {}]) expect(() => chat.listConversations({ before } as never)).toThrow(TypeError);
+    expect(() => chat.listConversations({ signal: {} } as never)).toThrow(TypeError);
+    for (const c of [undefined, null, "", 7, {}, { id: "" }]) {
+      expect(() => chat.openConversation(c as never)).toThrow(TypeError);
+      expect(() => chat.deleteConversation(c as never)).toThrow(TypeError);
+    }
+    expect(fake.seen).toHaveLength(n);
+    expect(shown(chat)).toEqual(["hi"]);
+  });
+
+  it("shows a conversation it opens in place of the one shown, its last 20 messages, and sends the next message there", async () => {
+    const fake = new FakeChat();
+    fake.conversationList = true;
+    const a = fake.conversation("alice", "", texts(25, "a"));
+    const b = fake.conversation("alice", "", ["b1", "b2"]);
+    const { chat } = setup({ token: ALICE }, fake);
+    expect((await chat.open()).conversation!.id).toBe(b.id);
+    const r = await done(chat.openConversation(a.id));
+    expect(r.conversation).toEqual({ id: a.id, createdAt: AT, updatedAt: AT, endedAt: null });
+    expect(chat.getState()).toMatchObject({ conversation: r.conversation, hasOlder: true, answering: false, outgoing: null, error: null });
+    expect(shown(chat)).toEqual(texts(25, "a").slice(5));
+    ok(await chat.send("more"));
+    expect(fake.requests("POST", "/chat/v1/conversations/" + a.id + "/messages")).toHaveLength(1);
+    expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(0);
+    expect(shown(chat).slice(-3)).toEqual(["a25", "more", "Hello"]);
+    expect(a.messages.map((m) => m.text).slice(-2)).toEqual(["more", "Hello"]);
+
+    const [top, next] = (await done(chat.listConversations())).conversations; // a moved to the top
+    expect([top.id, next.id]).toEqual([a.id, b.id]);
+    await done(chat.openConversation(next));
+    expect(chat.getState()).toMatchObject({ conversation: { id: b.id }, hasOlder: false });
+    expect(chat.getState().conversation).not.toHaveProperty("title");
+    expect(shown(chat)).toEqual(["b1", "b2"]);
+  });
+
+  it("watches an answer still being written in the conversation it opens", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const a = fake.conversation("alice", "", ["q1", "a1", "q2"]);
+    fake.conversation("alice", "", ["latest"]);
+    a.answering = 1;
+    a.pending = "a2";
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    await done(chat.openConversation(a.id));
+    expect(chat.getState()).toMatchObject({ conversation: { id: a.id }, answering: true });
+    expect(err(await chat.send("more")).code).toBe("busy");
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(chat.getState().answering).toBe(false);
+    expect(shown(chat)).toEqual(["q1", "a1", "q2", "a2"]);
+  });
+
+  it("opens a conversation on a page that hasn't opened the chat, never showing or watching the latest", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const a = fake.conversation("alice", "", ["a1", "a2"]);
+    const b = fake.conversation("alice", "", ["b1"]);
+    b.answering = 50;
+    const { chat, states } = setup({ token: ALICE }, fake);
+    await done(chat.openConversation(a.id));
+    expect(chat.getState()).toMatchObject({ status: "ready", conversation: { id: a.id }, answering: false });
+    expect(shown(chat)).toEqual(["a1", "a2"]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(states.some((s) => s.conversation !== null && s.conversation.id === b.id)).toBe(false);
+    expect(fake.requests("GET", "/chat/v1/conversations/" + b.id)).toHaveLength(0);
+  });
+
+  it("keeps what's shown, resolving aborted, when newConversation, a later openConversation or a message comes first", async () => {
+    const fake = new FakeChat();
+    fake.conversationList = true;
+    const a = fake.conversation("alice", "", ["a1"]);
+    const b = fake.conversation("alice", "", ["b1"]);
+    const chat = createChat({
+      url: ORIGIN,
+      token: ALICE,
+      fetch: async (u, i) => {
+        if (/\/conversations\/c\d+$/.test(String(u)) && i?.method === "GET") await new Promise((r) => setTimeout(r, 20));
+        return fake.fetch(u, i);
+      },
+    });
+    await chat.open();
+    const first = chat.openConversation(a.id);
+    expect(shown(chat)).toEqual(["b1"]); // until a is read
+    chat.newConversation();
+    expect((await fails(first)).code).toBe("aborted");
+    expect(chat.getState()).toMatchObject({ conversation: null, messages: [] });
+
+    const toA = chat.openConversation(a.id);
+    const toB = chat.openConversation(b.id); // ended by newConversation, and readable where the chat lists them
+    expect((await fails(toA)).code).toBe("aborted");
+    expect((await done(toB)).conversation).toMatchObject({ id: b.id, endedAt: "2026-11-17T00:00:00Z" });
+    expect(shown(chat)).toEqual(["b1"]);
+
+    const late = chat.openConversation(a.id);
+    const sent = chat.send("more");
+    ok(await sent);
+    expect((await fails(late)).code).toBe("aborted");
+    expect(chat.getState().conversation).toMatchObject({ id: b.id, endedAt: null }); // the message reopened it
+    expect(shown(chat)).toEqual(["b1", "more", "Hello"]);
+    expect(b.ended).toBeNull();
+  });
+
+  it("says not_found for a conversation that isn't the user's, keeping the one shown", async () => {
+    const fake = new FakeChat();
+    const hers = fake.conversation("bob", "", ["secret"]);
+    const mine = fake.conversation("alice", "", ["mine"]);
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    expect(await fails(chat.openConversation(hers.id))).toMatchObject({ code: "not_found", status: 404 });
+    expect(chat.getState()).toMatchObject({ conversation: { id: mine.id }, hasOlder: false, error: null });
+    expect(shown(chat)).toEqual(["mine"]);
+    ok(await chat.send("next"));
+    expect(fake.requests("POST", "/chat/v1/conversations/" + mine.id + "/messages")).toHaveLength(1);
+  });
+
+  it("adds the messages before the oldest shown, 20 at a time, until none are left", async () => {
+    const fake = new FakeChat();
+    const c = fake.conversation("alice", "", texts(45));
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    const kept = chat.getState().messages;
+    const one = await done(chat.loadOlder());
+    expect(one.messages.map((m) => m.text)).toEqual(texts(45).slice(5, 25));
+    expect(chat.getState().hasOlder).toBe(true);
+    expect(chat.getState().messages.slice(20).every((m, i) => m === kept[i])).toBe(true);
+    const two = await done(chat.loadOlder());
+    expect(two.messages.map((m) => m.text)).toEqual(texts(5));
+    expect(shown(chat)).toEqual(texts(45));
+    expect(chat.getState().hasOlder).toBe(false);
+    const n = fake.seen.length;
+    expect(await chat.loadOlder()).toEqual({ ok: true, messages: [] });
+    expect(fake.seen).toHaveLength(n);
+    const at = (i: number) => "/chat/v1/conversations/" + c.id + "?before=" + c.messages[i].id;
+    expect(older(fake)).toEqual([at(25), at(5)]);
+  });
+
+  it("shares one request among calls while one runs, and asks nothing with no conversation shown", async () => {
+    const fake = new FakeChat();
+    fake.conversation("alice", "", texts(30));
+    const { chat } = setup({ token: ALICE }, fake);
+    const { loadOlder } = chat;
+    expect(await loadOlder()).toEqual({ ok: true, messages: [] }); // nothing shown yet
+    expect(fake.seen).toHaveLength(0);
+    await chat.open();
+    const [x, y] = await Promise.all([loadOlder(), loadOlder()]);
+    expect(x).toBe(y);
+    expect((await done(Promise.resolve(x))).messages).toHaveLength(10);
+    expect(older(fake)).toHaveLength(1);
+    expect(shown(chat)).toEqual(texts(30));
+    chat.newConversation();
+    const n = fake.seen.length;
+    expect(await loadOlder()).toEqual({ ok: true, messages: [] });
+    expect(fake.seen).toHaveLength(n);
+  });
+
+  it("takes a page that brings nothing older for the end, whatever the chat says", async () => {
+    const fake = new FakeChat();
+    const c = fake.conversation("alice", "", texts(25));
+    const empty = { conversation: { id: c.id, created_at: AT, updated_at: AT }, messages: [], has_more: true, answering: false };
+    const chat = createChat({ url: ORIGIN, token: ALICE, fetch: async (u, i) => (String(u).includes("?before=") ? json(200, empty) : fake.fetch(u, i)) });
+    expect((await chat.open()).hasOlder).toBe(true);
+    expect(await chat.loadOlder()).toEqual({ ok: true, messages: [] });
+    expect(chat.getState().hasOlder).toBe(false);
+    expect(shown(chat)).toEqual(texts(25).slice(5));
+  });
+
+  it("adds nothing, resolving aborted, when the conversation shown changes meanwhile", async () => {
+    const fake = new FakeChat();
+    const a = fake.conversation("alice", "", texts(25, "a"));
+    fake.conversation("alice", "", texts(25, "b"));
+    const chat = createChat({
+      url: ORIGIN,
+      token: ALICE,
+      fetch: async (u, i) => {
+        if (String(u).includes("?before=")) await new Promise((r) => setTimeout(r, 20));
+        return fake.fetch(u, i);
+      },
+    });
+    await chat.open();
+    const p = chat.loadOlder();
+    await done(chat.openConversation(a.id));
+    expect((await fails(p)).code).toBe("aborted");
+    expect(shown(chat)).toEqual(texts(25, "a").slice(5));
+    expect(chat.getState().hasOlder).toBe(true);
+    const q = chat.loadOlder();
+    chat.newConversation();
+    expect((await fails(q)).code).toBe("aborted");
+    expect(chat.getState()).toMatchObject({ messages: [], hasOlder: false });
+  });
+
+  it("keeps the older messages it loaded when the conversation shown is read again, as after a lost stream", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    fake.conversation("alice", "", texts(25));
+    fake.turns.push({ deltas: ["Hel"], text: "Hello there", drop: "after-deltas", pollsAnswering: 1 });
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    await done(chat.loadOlder());
+    const oldest = chat.getState().messages[0];
+    expect(chat.getState().hasOlder).toBe(false);
+    const p = chat.send("q");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(ok(await p).message.text).toBe("Hello there");
+    expect(shown(chat)).toEqual([...texts(25), "q", "Hello there"]);
+    expect(chat.getState().messages[0]).toBe(oldest);
+    expect(chat.getState().hasOlder).toBe(false);
+    expect(fake.requests("GET").filter((s) => /\/conversations\/c\d+$/.test(s.path)).length).toBeGreaterThan(1);
+  });
+
+  it("drops older messages a read of the conversation shown doesn't reach back to, for loadOlder to bring", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const c = fake.conversation("alice", "", ["a1", "a2"]);
+    fake.turns.push({ drop: "after-message", text: "Late", pollsAnswering: 0 });
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    expect(chat.getState().hasOlder).toBe(false);
+    fake.add(c, texts(25, "x")); // another tab's
+    const p = chat.send("q");
+    await vi.advanceTimersByTimeAsync(10_000);
+    ok(await p);
+    expect(shown(chat)).toEqual([...texts(25, "x").slice(7), "q", "Late"]);
+    expect(chat.getState().hasOlder).toBe(true);
+    expect((await done(chat.loadOlder())).messages.map((m) => m.text)).toEqual(["a1", "a2", ...texts(7, "x")]);
+    expect(shown(chat)).toEqual(["a1", "a2", ...texts(25, "x"), "q", "Late"]);
+    expect(chat.getState().hasOlder).toBe(false);
+  });
+
+  it("keeps nothing of the conversation shown when the session opens again onto another, or someone else's", async () => {
+    const fake = new FakeChat();
+    const a = fake.conversation("alice", "", texts(25, "a"));
+    const b = fake.conversation("alice", "", texts(25, "b"));
+    const { chat } = setup({ tokenUrl: TOKEN_URL }, fake);
+    await chat.open();
+    await done(chat.openConversation(a.id));
+    await done(chat.loadOlder());
+    expect(chat.getState()).toMatchObject({ conversation: { id: a.id }, hasOlder: false });
+    const st = await chat.reopen();
+    expect(st).toMatchObject({ conversation: { id: b.id }, hasOlder: true });
+    expect(st.messages.map((m) => m.text)).toEqual(texts(25, "b").slice(5));
+
+    await done(chat.loadOlder());
+    expect(chat.getState().hasOlder).toBe(false);
+    const hers = fake.conversation("bob", "", texts(30, "h"));
+    for (const s of fake.sessions.values()) s.alive = false;
+    fake.tokenAnswers.push({ status: 200, body: { token: BOB } });
+    expect(err(await chat.send("alice's draft")).code).toBe("session_expired");
+    expect(chat.getState()).toMatchObject({ conversation: { id: hers.id }, hasOlder: true });
+    expect(shown(chat)).toEqual(texts(30, "h").slice(10));
+  });
+
+  it("shows nothing older once a start goes on in another conversation, or the one shown is gone", async () => {
+    const fake = new FakeChat();
+    fake.startPrompt = "Sum up.";
+    fake.conversation("alice", "", texts(25));
+    const { chat } = setup({ token: ALICE }, fake);
+    expect((await chat.open()).hasOlder).toBe(true);
+    fake.conversation("alice", "", ["another tab's"]);
+    ok(await chat.start());
+    expect(chat.getState().hasOlder).toBe(false);
+    expect(shown(chat)).toEqual(["Hello"]);
+
+    const gone = new FakeChat();
+    gone.conversation("alice", "", texts(25));
+    const g = setup({ token: ALICE }, gone);
+    expect((await g.chat.open()).hasOlder).toBe(true);
+    gone.convs.clear();
+    expect(err(await g.chat.send("q")).code).toBe("not_found");
+    expect(g.chat.getState()).toMatchObject({ conversation: null, messages: [], hasOlder: false });
+  });
+
+  it("reads when a conversation was ended, null while it isn't and from a chat that doesn't say", async () => {
+    const fake = new FakeChat();
+    fake.conversationList = true;
+    const over = fake.conversation("alice", "", ["over"]);
+    over.ended = "2026-11-16T10:00:00Z";
+    const going = fake.conversation("alice", "", ["going on"]);
+    const { chat } = setup({ token: ALICE }, fake);
+    expect((await chat.open()).conversation).toEqual({ id: going.id, createdAt: AT, updatedAt: AT, endedAt: null });
+    const listed = (await done(chat.listConversations())).conversations;
+    expect(listed.map((c) => [c.title, c.endedAt])).toEqual([["going on", null], ["over", "2026-11-16T10:00:00Z"]]);
+    const older = { id: "c1", created_at: AT, updated_at: AT };
+    const old = createChat({ url: ORIGIN, fetch: async () => json(200, { anonymous: true, started: false, conversation: older, messages: [], answering: false }) });
+    expect((await old.open()).conversation).toEqual({ id: "c1", createdAt: AT, updatedAt: AT, endedAt: null });
+  });
+
+  it("ends the conversation shown: shows none at once, and sends the end with keepalive, so no page shows it again", async () => {
+    for (const keepsCookie of [true, false]) {
+      const fake = new FakeChat();
+      fake.keepsCookie = keepsCookie;
+      const { chat } = setup({ token: ALICE }, fake);
+      ok(await chat.send("one"));
+      const id = chat.getState().conversation!.id;
+      const p = chat.endConversation();
+      expect(chat.getState()).toMatchObject({ status: "ready", conversation: null, messages: [], hasOlder: false, answering: false, outgoing: null, error: null });
+      await expect(p).resolves.toBeUndefined();
+      const [end, ...more] = fake.requests("POST", "/chat/v1/conversations/" + id + "/end");
+      expect(more).toHaveLength(0);
+      expect(end.init).toMatchObject({ keepalive: true, credentials: "include" });
+      // No body, and with the cookie no bearer: nothing a preflight would have to clear first.
+      expect([end.body, end.headers.get("Content-Type"), end.auth]).toEqual([undefined, null, keepsCookie ? null : "Bearer " + ALICE]);
+      expect(fake.convs.get(id)!.ended).not.toBeNull();
+      expect((await setup({ token: ALICE }, fake).chat.open()).conversation).toBeNull();
+      const n = fake.seen.length;
+      await chat.endConversation(); // nothing shown
+      expect(fake.seen).toHaveLength(n);
+    }
+  });
+
+  it("cuts short an answer under way in the conversation it ends", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    ok(await chat.send("one"));
+    const id = chat.getState().conversation!.id;
+    fake.turns.push({ stall: true });
+    const p = chat.send("two");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(chat.getState().answering).toBe(true);
+    await chat.endConversation();
+    expect(err(await p).code).toBe("aborted");
+    expect(chat.getState()).toMatchObject({ conversation: null, messages: [], answering: false, answer: null, outgoing: null });
+    expect(fake.convs.get(id)!.ended).not.toBeNull();
+  });
+
+  it("ends the conversation the session opens on when called before it opened, awaiting an opening under way", async () => {
+    const fake = new FakeChat();
+    const old = fake.conversation("alice", "", ["old"]);
+    const { chat, states } = setup({ token: ALICE }, fake);
+    await chat.endConversation(); // nothing opening: it settles at once, sending nothing
+    expect(fake.seen).toHaveLength(0);
+    expect((await chat.open()).conversation).toBeNull();
+    expect(states.some((s) => s.messages.length > 0)).toBe(false);
+    expect(fake.requests("POST", "/chat/v1/conversations/" + old.id + "/end")).toHaveLength(1);
+    expect(old.ended).not.toBeNull();
+
+    const next = fake.conversation("alice", "", ["next"]);
+    let release = () => {};
+    const fetch = async (u: RequestInfo | URL, i?: RequestInit) => {
+      if (String(u).endsWith("/end")) await new Promise<void>((r) => (release = r));
+      return fake.fetch(u, i);
+    };
+    const slow = setup({ token: ALICE, fetch }, fake).chat;
+    const opening = slow.open();
+    let settled = false;
+    const ended = slow.endConversation().then(() => (settled = true));
+    expect((await opening).conversation).toBeNull();
+    expect(settled).toBe(false); // the end is on its way
+    release();
+    await ended;
+    expect(next.ended).not.toBeNull();
+    expect((await setup({ token: ALICE }, fake).chat.open()).conversation).toBeNull();
+  });
+
+  it("tries an end again through about a minute while the chat can't be reached or asks to wait, then gives up quietly", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    let tries = 0;
+    let offline = 0;
+    const fetch = (u: RequestInfo | URL, i?: RequestInit) => {
+      if (!String(u).endsWith("/end")) return fake.fetch(u, i);
+      tries++;
+      return offline-- > 0 ? Promise.reject(new TypeError("offline")) : fake.fetch(u, i);
+    };
+    const { chat } = setup({ token: ALICE, fetch }, fake);
+    ok(await chat.send("one"));
+    const first = chat.getState().conversation!.id;
+    offline = 2;
+    fake.refusals.push({ method: "POST", path: /\/end$/, status: 429, error: "rate_limited", retryAfter: 2, times: 1 });
+    let settled = false;
+    void chat.endConversation().then(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect([tries, settled]).toEqual([3, false]); // at 0, 1 and 3 s
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect([tries, settled]).toEqual([4, true]); // at 5 s, as the chat said
+    expect(fake.convs.get(first)!.ended).not.toBeNull();
+    expect(chat.getState().waiting).toBeNull();
+
+    ok(await chat.send("two"));
+    const second = chat.getState().conversation!.id;
+    fake.refusals.push({ method: "POST", path: /\/end$/, status: 503, error: "overloaded", retryAfter: 5 });
+    tries = 0;
+    settled = false;
+    void chat.endConversation().then(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(55_500);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect([tries, settled]).toEqual([13, true]); // at 0, 5, … 60 s
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(tries).toBe(13);
+    expect(fake.convs.get(second)!.ended).toBeNull();
+  });
+
+  it("gives an end up at once for a refusal waiting won't fix, and tries it no more once the user signs out", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    let tries = 0;
+    let offline = false;
+    const fetch = (u: RequestInfo | URL, i?: RequestInit) => {
+      if (!String(u).endsWith("/end")) return fake.fetch(u, i);
+      tries++;
+      return offline ? Promise.reject(new TypeError("offline")) : fake.fetch(u, i);
+    };
+    const { chat } = setup({ token: ALICE, fetch }, fake);
+    ok(await chat.send("one"));
+    fake.refusals.push({ method: "POST", path: /\/end$/, status: 403, error: "origin_not_allowed", times: 1 });
+    await chat.endConversation();
+    expect(tries).toBe(1);
+
+    ok(await chat.send("two"));
+    offline = true;
+    tries = 0;
+    let settled = false;
+    void chat.endConversation().then(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect([tries, settled]).toEqual([2, false]);
+    await chat.signOut();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect([tries, settled]).toEqual([2, true]);
+  });
+
+  it("ends as the session's user, opening the session again once when it lapsed", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ tokenUrl: TOKEN_URL }, fake);
+    ok(await chat.send("one"));
+    const id = chat.getState().conversation!.id;
+    for (const s of fake.sessions.values()) s.alive = false;
+    await chat.endConversation();
+    expect(fake.requests("POST", "/chat/v1/conversations/" + id + "/end")).toHaveLength(2);
+    expect(fake.convs.get(id)!.ended).not.toBeNull();
+    expect(chat.getState()).toMatchObject({ status: "ready", anonymous: false, conversation: null });
+  });
+
+  it("ends nothing when it opens another conversation, and keeps the one shown when the read fails", async () => {
+    const fake = new FakeChat();
+    const a = fake.conversation("alice", "", ["a1"]);
+    const b = fake.conversation("alice", "", ["b1"]);
+    let offline = false;
+    const fetch = (u: RequestInfo | URL, i?: RequestInit) => (offline ? Promise.reject(new TypeError("offline")) : fake.fetch(u, i));
+    const { chat } = setup({ token: ALICE, fetch }, fake);
+    await chat.open();
+    offline = true;
+    expect(await fails(chat.openConversation(a.id))).toMatchObject({ code: "network" });
+    expect(chat.getState()).toMatchObject({ conversation: { id: b.id }, error: null });
+    expect(shown(chat)).toEqual(["b1"]);
+    offline = false;
+    await done(chat.openConversation(a.id));
+    expect(shown(chat)).toEqual(["a1"]);
+    expect(fake.seen.some((s) => s.path.endsWith("/end"))).toBe(false);
+    expect(b.ended).toBeNull();
+    expect((await chat.reopen({ token: ALICE })).conversation!.id).toBe(b.id); // the latest, still going on
+  });
+
+  it("deletes a conversation where the chat lists them, forgetting it when shown, and takes one already gone for deleted", async () => {
+    const fake = new FakeChat();
+    fake.conversationList = true;
+    const a = fake.conversation("alice", "", ["a1"]);
+    const b = fake.conversation("alice", "", ["b1"]);
+    const { chat } = setup({ token: ALICE }, fake);
+    expect(await chat.deleteConversation(a.id)).toEqual({ ok: true }); // opening the session first
+    expect(fake.convs.has(a.id)).toBe(false);
+    expect(chat.getState()).toMatchObject({ status: "ready", conversation: { id: b.id } });
+    expect(await chat.deleteConversation(a.id)).toEqual({ ok: true });
+    expect(fake.requests("DELETE", "/chat/v1/conversations/" + a.id)).toHaveLength(2);
+    expect(await chat.deleteConversation(chat.getState().conversation!)).toEqual({ ok: true });
+    expect(fake.convs.has(b.id)).toBe(false);
+    expect(chat.getState()).toMatchObject({ conversation: null, messages: [], hasOlder: false });
+    expect(fake.seen.some((s) => s.path.endsWith("/end"))).toBe(false);
+    ok(await chat.send("next"));
+    expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(1);
+  });
+
+  it("refuses deleting where the chat lists none: without a request once its session says so, or as the chat says", async () => {
+    const fake = new FakeChat();
+    const c = fake.conversation("alice", "", ["hi"]);
+    const { chat } = setup({ token: ALICE }, fake);
+    expect(await fails(chat.deleteConversation(c.id))).toMatchObject({ code: "conversation_list_off", status: 0, retryable: false });
+    expect(fake.requests("DELETE")).toHaveLength(0);
+    expect(chat.getState()).toMatchObject({ status: "ready", conversation: { id: c.id } });
+    fake.conversationList = true;
+    await chat.reopen({ token: ALICE });
+    fake.conversationList = false; // turned off since the session said
+    expect(await fails(chat.deleteConversation(c.id))).toMatchObject({ code: "conversation_list_off", status: 403 });
+    expect(fake.convs.has(c.id)).toBe(true);
+    expect(chat.getState().conversation!.id).toBe(c.id);
+  });
+
+  it("says busy while an answer is being written in the conversation, deleting nothing", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    fake.conversationList = true;
+    const c = fake.conversation("alice", "", ["q1"]);
+    c.answering = 1;
+    c.pending = "a1";
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    expect(await fails(chat.deleteConversation(c.id))).toMatchObject({ code: "busy", status: 409, retryable: true });
+    expect(chat.getState()).toMatchObject({ conversation: { id: c.id }, answering: true });
+    expect(fake.convs.has(c.id)).toBe(true);
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(chat.getState().answering).toBe(false);
+    expect(await chat.deleteConversation(c.id)).toEqual({ ok: true });
+    expect(chat.getState().conversation).toBeNull();
+  });
+
+  it("forgets the conversation shown once another tab ended it where the chat lists none: reading, sending or following it", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const c = fake.conversation("alice", "", texts(25));
+    const [reader, sender, follower, ender] = [1, 2, 3, 4].map(() => setup({ token: ALICE }, fake).chat);
+    for (const tab of [reader, sender, ender]) expect((await tab.open()).conversation!.id).toBe(c.id);
+    await ender.endConversation();
+
+    expect(await fails(reader.loadOlder())).toMatchObject({ code: "not_found" });
+    expect(reader.getState()).toMatchObject({ conversation: null, messages: [], hasOlder: false });
+
+    expect(err(await sender.send("more")).code).toBe("not_found");
+    expect(sender.getState()).toMatchObject({ conversation: null, messages: [], outgoing: "more" });
+    ok(await sender.send("more"));
+    expect(sender.getState().conversation!.id).not.toBe(c.id);
+    expect(c.messages).toHaveLength(25);
+
+    const d = fake.conversation("alice", "", ["q"]);
+    d.answering = 50;
+    expect(await follower.open()).toMatchObject({ conversation: { id: d.id }, answering: true });
+    await ender.reopen({ token: ALICE });
+    await ender.endConversation();
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(follower.getState()).toMatchObject({ conversation: null, messages: [], answering: false });
+  });
+
+  it("ends a first message's conversation once the chat names it, ended before: unseen, and a send meanwhile unaffected", async () => {
+    for (const part of ["answer", "body"] as const) {
+      const fake = new FakeChat();
+      fake.turns.push({ deltas: ["unseen"] }, { deltas: ["seen"] });
+      const g = gated(fake, /\/conversations$/, part);
+      const { chat, states } = setup({ token: ALICE, fetch: g.fetch }, fake);
+      await chat.open();
+      const first = chat.send("first");
+      await new Promise((r) => setTimeout(r, 5));
+      expect(chat.getState()).toMatchObject({ outgoing: "first", answering: true, conversation: null });
+      let settled = false;
+      const ended = chat.endConversation().then(() => (settled = true));
+      expect(chat.getState()).toMatchObject({ conversation: null, messages: [], outgoing: null, answer: null, answering: false });
+      expect(err(await first).code).toBe("aborted"); // at once, as before
+
+      ok(await chat.send("next"));
+      const next = chat.getState().conversation!.id;
+      const unnamed = Array.from(fake.convs.values()).find((c) => c.id !== next)!;
+      expect([unnamed.ended, settled]).toEqual([null, false]);
+      g.release();
+      await ended;
+      expect(unnamed.ended).not.toBeNull();
+      expect(fake.convs.get(next)!.ended).toBeNull();
+      expect(fake.requests("POST").filter((s) => s.path.endsWith("/end")).map((s) => s.path)).toEqual(["/chat/v1/conversations/" + unnamed.id + "/end"]);
+      expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(2);
+      expect(chat.getState()).toMatchObject({ conversation: { id: next }, outgoing: null, waiting: null, error: null });
+      expect(shown(chat)).toEqual(["next", "seen"]);
+      for (const s of states) {
+        expect(s.conversation ? s.conversation.id : null).not.toBe(unnamed.id);
+        expect(s.answer ? s.answer.text : "").not.toBe("unseen");
+        expect(s.messages.map((m) => m.text)).not.toContain("first");
+      }
+    }
+  });
+
+  it("ends a start's new conversation once the chat names it, ended before, unseen", async () => {
+    for (const part of ["answer", "body"] as const) {
+      const fake = new FakeChat();
+      fake.startPrompt = "Greet them.";
+      fake.turns.push({ deltas: ["unseen"] }, { deltas: ["seen"] });
+      const g = gated(fake, /\/start$/, part);
+      const { chat, states } = setup({ token: ALICE, fetch: g.fetch }, fake);
+      await chat.open();
+      const greeting = chat.start();
+      await new Promise((r) => setTimeout(r, 5));
+      expect(chat.getState().answering).toBe(true);
+      const ended = chat.endConversation();
+      expect(err(await greeting).code).toBe("aborted");
+      expect(chat.getState()).toMatchObject({ conversation: null, messages: [], answer: null, answering: false });
+
+      ok(await chat.send("next"));
+      const next = chat.getState().conversation!.id;
+      g.release();
+      await ended;
+      expect(fake.requests("POST", "/chat/v1/start")[0].body).toMatchObject({ new: true });
+      const greeted = Array.from(fake.convs.values()).find((c) => c.id !== next)!;
+      expect(greeted.ended).not.toBeNull();
+      expect(fake.convs.get(next)!.ended).toBeNull();
+      expect(shown(chat)).toEqual(["next", "seen"]);
+      expect(states.some((s) => (s.conversation && s.conversation.id === greeted.id) || (s.answer && s.answer.text === "unseen"))).toBe(false);
+    }
+  });
+
+  it("ends nothing for a first message ended before the chat named a conversation, when it's refused, and never sends it again", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    fake.refusals.push({ method: "POST", path: /\/conversations$/, status: 429, error: "rate_limited", retryAfter: 2, times: 2 });
+    const g = gated(fake, /\/conversations$/, "answer");
+    const { chat, states } = setup({ token: ALICE, fetch: g.fetch }, fake);
+    await chat.open();
+    const first = chat.send("first");
+    await vi.advanceTimersByTimeAsync(5);
+    const ended = chat.endConversation(); // while the message is out
+    expect(err(await first).code).toBe("aborted");
+    g.release(); // refused: nothing was started
+    await ended;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(1);
+    expect(states.every((s) => s.waiting === null)).toBe(true);
+    expect(chat.getState()).toMatchObject({ conversation: null, outgoing: null, error: null });
+
+    const second = chat.send("second"); // refused too, and ended while it waits to try again
+    await vi.advanceTimersByTimeAsync(500);
+    expect(chat.getState().waiting).toMatchObject({ code: "rate_limited" });
+    await chat.endConversation();
+    expect(err(await second).code).toBe("aborted");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(2);
+    expect(fake.seen.some((s) => s.path.endsWith("/end"))).toBe(false);
+    expect(fake.convs.size).toBe(0);
+  });
+
+  it("ends nothing for a first message ended before the chat named a conversation once the user changes meanwhile", async () => {
+    const fake = new FakeChat();
+    const g = gated(fake, /\/conversations$/, "body");
+    const { chat } = setup({ token: ALICE, fetch: g.fetch }, fake);
+    await chat.open();
+    const first = chat.send("first");
+    await new Promise((r) => setTimeout(r, 5));
+    const ended = chat.endConversation();
+    expect(err(await first).code).toBe("aborted");
+    expect((await chat.reopen({ token: BOB })).status).toBe("ready");
+    g.release();
+    await ended;
+    expect(fake.seen.some((s) => s.path.endsWith("/end"))).toBe(false);
+    expect(Array.from(fake.convs.values()).map((c) => c.ended)).toEqual([null]);
   });
 });

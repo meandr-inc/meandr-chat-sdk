@@ -11,6 +11,7 @@ export type ChatErrorCode =
   | "start_not_allowed"
   | "attachments_off"
   | "storage_full"
+  | "conversation_list_off"
   | "not_found"
   | "busy"
   | "too_large"

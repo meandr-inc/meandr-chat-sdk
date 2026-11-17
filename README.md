@@ -41,17 +41,18 @@ const result = await chat.send("Where is my order?");
 The client does nothing until it's used, so create it with the page: until then it sends nothing, loads nothing and
 leaves nothing behind. Create one client per page, not one per component render. It activates in one of three ways:
 
-- **`open()`**, when the visitor shows interest: opens the chat, or starts typing. It loads their latest conversation.
+- **`open()`**, when the visitor shows interest: opens the chat, or starts typing. It loads their latest conversation
+  they haven't ended, its last 20 messages.
 - **`send(text)`** opens by itself.
 - **`start()`** has the assistant speak first, such as a greeting or a summary of what needs the visitor's attention.
-  What it does is the chat's own start instructions, set in its settings (`CHAT_START_PROMPT`), so a page or a visitor
+  What it does is the chat's own start instructions, its **Intro prompt** setting (`CHAT_START_PROMPT`), so a page or a visitor
   can't supply them; the visitor sees only the answer. Without them, it's refused (`start_not_allowed`). With no
   conversation shown, after `newConversation()` say, it speaks in a new one.
 
 ## Who the user is
 
 Give the client one way to get your user's token. A token is a JWT your backend signs with the chat's **Session
-signing secret**. See the help center's "Sign your users in to Meandr Chat".
+secret key**. See the help center's "Sign your users in to Meandr Chat".
 
 | Option | For | The client |
 |---|---|---|
@@ -97,15 +98,21 @@ can't silently resume someone's session.
 | `send(text, { files })` | sends the message and streams the answer into the state. `files` are those `attach` gave, as ChatFiles or ids; with any, `text` may be `""`. Resolves with `{ ok: true, message, stop }`, the stored answer, or `{ ok: false, error }` |
 | `attach(file, { name, onProgress, signal })` | uploads a `File` or `Blob` for a message of the visitor's within the hour, opening the session if need be: see [Files](#files). `name` is the file's own unless given, else `"file"`; `onProgress(sent, total)` follows its bytes; `signal` cancels it. Resolves with `{ ok: true, file }`, a ChatFile, or `{ ok: false, error }`, and changes nothing in the state |
 | `readFile(file, { signal })` | fetches a file the visitor attached, by its ChatFile or id, with the session's credentials, opening the session if need be. Resolves with `{ ok: true, blob }` or `{ ok: false, error }` |
-| `start()` | has the assistant speak first, as the chat's start instructions say, and streams the answer: in the user's latest conversation, usually the one shown, or a new one when none is shown or the chat is set so. Resolves as `send` does |
-| `newConversation()` | forgets the current conversation: the next message, or `start()`, starts a new one |
+| `start()` | has the assistant speak first, as the chat's start instructions say, and streams the answer: in the user's latest conversation they haven't ended, usually the one shown, or a new one when none is shown. Resolves as `send` does |
+| `endConversation()` | ends the conversation shown and forgets it at once, so no page shows it again by itself: see [Conversations](#conversations). Resolves once the chat has it, or after about a minute of trying; never rejects |
+| `newConversation()` | ends the conversation shown, as `endConversation()` does: the next message, or `start()`, starts a new one |
+| `listConversations({ before, signal })` | lists the user's conversations, 20 at a time, most recently active first, opening the session if need be: see [Conversations](#conversations). `before`, a Conversation or its id, goes on after that one; `signal` cancels it. Resolves with `{ ok: true, conversations, hasMore }`, each with its `title`, or `{ ok: false, error }`, and changes nothing in the state |
+| `openConversation(conversation)` | shows that conversation, a Conversation or its id, in place of the current one once it's read: its last 20 messages. It ends nothing, and the next message goes there. Resolves with `{ ok: true, conversation }`, or `{ ok: false, error }` with the current one still shown |
+| `deleteConversation(conversation)` | deletes that conversation, a Conversation or its id, with its messages and files, opening the session if need be. One already gone counts as deleted; the one shown is forgotten. Resolves with `{ ok: true }` or `{ ok: false, error }`, and is refused as `busy` while an answer is being written in it |
+| `loadOlder()` | adds the 20 messages before the oldest shown to the front of `messages`, while `hasOlder`. Resolves with `{ ok: true, messages }`, those it added, or `{ ok: false, error }` |
 | `reopen({ token })` | the user changed without a page load: signed in, signed out or switched team. Forgets everything shown and, if the chat was open, opens it again. Pass `token` when you give `token` |
 | `signOut()` | ends the session and forgets the user, even if the page never showed the chat. Call it from your sign-out and await it before you navigate: it settles within three seconds, and never rejects |
 | `destroy()` | stops everything this client does; it sends nothing more |
 
 No member rejects for a chat failure: the result and the state carry it. Members work passed around on their own, as
-in `onClick={chat.newConversation}` or `onFocus={chat.open}`; `send`, `attach`, `readFile` and `reopen` take arguments,
-so call those yourself rather than handing them an event.
+in `onClick={chat.endConversation}` or `onFocus={chat.open}`; `send`, `attach`, `readFile`, `listConversations`,
+`openConversation`, `deleteConversation` and `reopen` take arguments, so call those yourself rather than handing them
+an event.
 
 ## The state
 
@@ -113,8 +120,9 @@ so call those yourself rather than handing them an event.
 |---|---|
 | `status` | `"idle"` before opening, `"opening"`, `"ready"`, or `"error"` when opening failed (`error` says why) |
 | `anonymous` | whether the session is an anonymous visitor's; `null` before opening |
-| `conversation` | `{ id, createdAt, updatedAt }`, or `null` before the first message |
-| `messages` | the conversation's stored messages, oldest first: `{ id, role, text, tools?, toolTitles?, files?, createdAt }`. `tools` names the tools the answer used, and `toolTitles`, with it, gives each one's title by name, its name where the chat knows none; `files` are the ChatFiles the visitor attached |
+| `conversation` | `{ id, createdAt, updatedAt, endedAt }`, or `null` before the first message. `endedAt` is when the user ended it, `null` while they haven't; their next message there reopens it |
+| `messages` | the conversation's stored messages, oldest first: its last 20 when it's shown, and older ones as `loadOlder()` adds them. Each is `{ id, role, text, tools?, toolTitles?, files?, createdAt }`. `tools` names the tools the answer used, and `toolTitles`, with it, gives each one's title by name, its name where the chat knows none; `files` are the ChatFiles the visitor attached |
+| `hasOlder` | the conversation shown has messages older than those in `messages`: `loadOlder()` adds them |
 | `outgoing` | the text of the message being sent, `""` with files alone, until the page shows it stored. With `error` set, it may not have reached the chat: offer to send it again, with its files, which never stores it twice |
 | `answer` | the answer being written in this page: `{ text, tools: [{ name, status, title }] }`, or `null`. Show a tool's `title`: its name when the chat knows none |
 | `answering` | an answer is being written in this conversation: in this page, or one the page lost or a previous page left running |
@@ -122,6 +130,7 @@ so call those yourself rather than handing them an event.
 | `stop` | why the last answer ended: `"end"`, `"max_tokens"` (cut short), `"refusal"` or `"paused"`; `null` when unknown |
 | `error` | the last failure, until the next action |
 | `files` | what the chat takes, as its session says: `{ types, maxBytes, perMessage }`, the media types, a file's most bytes and a message's most files. `null` before opening and while it takes no file: offer attaching only when it isn't `null` |
+| `conversationList` | whether the chat lists the user's conversations, as its session says: offer the list, and opening and deleting conversations from it, only while it's `true`. `null` before opening |
 
 Show `messages`, then `outgoing`, then `answer`. Disable sending while `answering` or `status` is `"opening"`. An
 assistant's `text` is Markdown from a model: render it with `@meandr/chat-sdk/markdown`, or another renderer that
@@ -129,9 +138,66 @@ never passes raw HTML through. A user's text is plain text.
 
 The state is replaced, never changed in place. Messages that didn't change keep their objects, and so does `files`.
 
+## Conversations
+
+A conversation goes on, through reloads and a closed chat, until the user ends it. Then no page shows it again by
+itself, and the next message, or `start()`, begins a new one. Offer ending always. Messages come 20 at a time: a
+conversation shows its last 20, and `loadOlder()` adds the 20 before the oldest shown while `hasOlder`. Where the
+chat's **Conversation list** setting is on (`CHAT_CONVERSATION_LIST`), a page may also offer the user's conversations,
+ended ones included, to open or delete:
+
+```js
+endButton.onclick = () => {
+  chat.endConversation();                         // shows none at once; the end outlives the page
+  panel.hidden = true;
+};
+newButton.onclick = chat.newConversation;         // ends it too: the next message begins another
+listButton.hidden = !state.conversationList;      // the list, opening and deleting: only while the chat lists them
+
+const page = await chat.listConversations();      // the 20 most recently active, and page.hasMore
+if (page.ok) rows = page.conversations;           // { id, title, createdAt, updatedAt, endedAt }
+const next = await chat.listConversations({ before: rows[rows.length - 1] }); // the 20 after those
+
+await chat.openConversation(rows[2]);             // shows it, ending none: the next message goes there
+await chat.deleteConversation(rows[3]);           // with its messages and files
+
+scroller.onscroll = () => {
+  if (scroller.scrollTop === 0 && chat.getState().hasOlder) chat.loadOlder(); // then keep the visitor's place
+};
+```
+
+- **Ending** forgets the conversation shown at once, and tells the chat with `keepalive`, so the end goes through
+  when the page navigates away right after. It's tried again through about a minute while the chat can't be reached
+  or asks to wait. `endConversation()` resolves once the chat has it, and never rejects. A first message or `start()`
+  still on its way, its new conversation not named yet, resolves `aborted` at once but goes on unseen until the chat
+  names that conversation, which is then ended. Called before the session opens, it ends the conversation the session
+  opens on, which the page then never shows; with no opening under way, it resolves at once. `newConversation()` does
+  the same, for a "New conversation" that begins the next one at once.
+- **The list** comes most recently active first, 20 at a time: pass the last one shown as `before` for the next 20,
+  while `hasMore`. A conversation that gets a message meanwhile moves to the top, so the walk may miss it or show it
+  twice: read the first page again to see what's new. A `title` is the start of the conversation's first message, `""`
+  while it has none, as after a `start()` alone; only the list carries it. `endedAt` says which ones the user ended.
+- **Opening** one reads it, then shows its last 20 messages in place of the current one, following an answer still
+  being written in it. The current one isn't ended, and stays shown when the read fails. One the user ended shows with
+  its `endedAt`, and their next message there reopens it. A `newConversation()`, a later `openConversation()`, or a
+  message or `start()` before it's shown wins, and it resolves `aborted`. A conversation that isn't the user's is
+  `not_found`.
+- **Deleting** one takes its messages and files with it. One already gone counts as deleted, and the one shown is
+  forgotten. While an answer is being written in it, it's refused as `busy`.
+- **Older messages** go to the front of `messages`; `loadOlder()` resolves with them, `[]` when none remain, and calls
+  while one runs share it. A conversation read again, as when the client follows a lost stream, keeps those it loaded.
+- **Where the chat lists none** (`conversationList` is `false`), `listConversations()` and `deleteConversation()` are
+  refused without a request (`conversation_list_off`), and a conversation the user ended is gone for them. Opening the
+  others and loading older messages work either way.
+- **Gone elsewhere:** a conversation shown that another tab deleted, or ended where the chat lists none, reads as
+  missing. The client forgets it at its next read or message, which says `not_found`.
+- **`start()`** speaks in the user's latest conversation they haven't ended, which may not be the one shown: the page
+  then shows that conversation, with the answer alone. With none shown, after `endConversation()` say, it speaks in a
+  new one.
+
 ## Files
 
-Where the chat's settings take files (`CHAT_ATTACHMENTS`), a visitor may attach them to a message for the model to
+Where the chat's **Attachments** setting is on (`CHAT_ATTACHMENTS`), a visitor may attach them to a message for the model to
 read: images (PNG, JPEG, WebP, GIF), PDFs, and text (plain, Markdown, CSV). They never reach your workspace's tools.
 
 ```js
@@ -223,10 +289,11 @@ Show your own words for the code:
 | `attachments_off` | This chat doesn't take files. |
 | `unsupported_type` | That kind of file can't be attached. |
 | `storage_full` | You can't attach more files for now. (The visitor's files, those in conversations included, fill the space the chat allows.) |
+| `conversation_list_off` | (nothing: offer the list, opening and deleting only while `conversationList` is `true`) |
 | `not_found` | This conversation is gone. (From `readFile`: That file is gone.) |
-| `busy` | Still answering your previous message. |
+| `busy` | Still answering your previous message. (From `deleteConversation`: It's still answering there. Try again when it's done.) |
 | `too_large` | That message is too long. (From `attach`: That file is too large.) |
-| `rate_limited` | You're sending messages too fast. Try again in a moment. |
+| `rate_limited` | You're sending messages too fast. Try again in a moment. (Also when the workspace is past its plan's limit on requests.) |
 | `overloaded` | The chat is busy. Try again in a moment. (The chat's machine is short of memory.) |
 | `model_busy` | The assistant is busy. Try again in a moment. |
 | `interrupted`, `timeout`, `unavailable`, `no_answer` | The answer failed. Try again. |
@@ -249,10 +316,10 @@ Codes the client doesn't know may come: show a general error for those.
   settings change: it tries again briskly through the first minute, then every 15 to 30 s, until the chat answers or
   the page leaves. `waiting` says so meanwhile, so the page never needs a reload, and a `send` or `start` called
   meanwhile waits with it.
-- **Waiting:** it waits as long as the chat says, up to a minute, when the visitor writes too fast or the chat's
-  machine is short of memory, and up to two minutes when the user's previous answer is still running, in another tab
-  perhaps. Past the answers the chat writes at once, an answer waits its turn on the open stream, so nothing is
-  refused for it.
+- **Waiting:** it waits as long as the chat says, up to a minute, when the visitor writes too fast, the workspace is
+  past its plan's limit on requests or the chat's machine is short of memory, and up to two minutes when the user's
+  previous answer is still running, in another tab perhaps. Past the answers the chat writes at once, an answer waits
+  its turn on the open stream, so nothing is refused for it.
 - **Nothing twice:** it tries a message again only when the chat refused it before storing it. When the connection
   drops or the chat fails while sending, it looks for the message in the conversation before saying it failed. A
   start that fails with `network` may have begun, so calling it again can have the assistant speak twice.

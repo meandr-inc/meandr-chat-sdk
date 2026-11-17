@@ -89,6 +89,7 @@ interface Conv {
   messages: Message[];
   answering: number;
   pending: string | null;
+  ended: string | null;
 }
 
 interface Identity {
@@ -99,6 +100,7 @@ interface Identity {
 
 export const ORIGIN = "https://calm-otter.meandr.io";
 export const TOKEN_URL = "https://shop.example/chat_token";
+const PAGE = 20; // messages or conversations a read answers
 
 // jwt makes a customer's token as the chat reads it; the fake checks no signature.
 export function jwt(claims: { sub: string; ext?: unknown; aud?: string; exp?: number; n?: number }): string {
@@ -133,7 +135,6 @@ export class FakeChat {
   internalAfterStore = 0;
   failViews = 0;
   startPrompt: string | null = null; // the app's CHAT_START_PROMPT; null refuses a start
-  startNew = false; // CHAT_START_CONVERSATION new
   attachments = true; // CHAT_ATTACHMENTS
   fileTypes = TYPES.slice(); // the kinds switched on
   maxFileBytes = 7 << 20; // CHAT_ATTACHMENT_MAX_MIB
@@ -141,6 +142,7 @@ export class FakeChat {
   storageBytes = 50 << 20; // CHAT_ATTACHMENT_STORAGE_MIB
   saysFiles = true; // false plays a chat from before files, whose session says nothing of them
   contextMax: number | null = 8 << 10; // CHAT_PAGE_CONTEXT_KIB; null plays a chat from before page context
+  conversationList: boolean | null = false; // CHAT_CONVERSATION_LIST; null plays a chat from before the list
   files = new Map<string, Stored>();
   private n = 0;
   private msgId = 0;
@@ -182,12 +184,16 @@ export class FakeChat {
       const who = this.identify(bearer);
       return "status" in who ? who : this.startTurn(who, (body || {}) as { new?: boolean; context?: unknown }, init.signal);
     }
-    const m = /^\/chat\/v1\/conversations(?:\/([^/]+)(\/messages)?)?$/.exec(path);
+    const m = /^\/chat\/v1\/conversations(?:\/([^/?]+)(\/messages|\/end)?)?(?:\?(.*))?$/.exec(path);
     if (m) {
       const who = this.identify(bearer);
       if ("status" in who) return who;
-      if (method === "GET" && m[1] && !m[2]) return this.view(who, decodeURIComponent(m[1]));
-      if (method === "POST" && (!m[1] || m[2])) return this.message(who, m[1] ? decodeURIComponent(m[1]) : null, body, init.signal);
+      const id = m[1] ? decodeURIComponent(m[1]) : null;
+      const before = new URLSearchParams(m[3] || "").get("before");
+      if (method === "GET" && !m[2]) return id ? this.view(who, id, before) : this.list(who, before);
+      if (method === "POST" && id && m[2] === "/end") return this.end(who, id);
+      if (method === "POST" && (!id || m[2] === "/messages")) return this.message(who, id, body, init.signal);
+      if (method === "DELETE" && id && !m[2]) return this.remove(who, id);
     }
     const f = /^\/chat\/v1\/files(?:\/([^/?]+))?(?:\?(.*))?$/.exec(path);
     if (f) {
@@ -213,10 +219,15 @@ export class FakeChat {
 
   conversation(sub: string, ext = "", texts: string[] = []): Conv {
     const id = "c" + ++this.n;
-    const c: Conv = { id, sub, ext, messages: [], answering: 0, pending: null };
-    texts.forEach((text, i) => c.messages.push(this.msg(i % 2 ? "assistant" : "user", text)));
+    const c: Conv = { id, sub, ext, messages: [], answering: 0, pending: null, ended: null };
+    this.add(c, texts);
     this.convs.set(id, c);
     return c;
+  }
+
+  // add stores the next messages of c, the user's and the assistant's in turn, as another tab would.
+  add(c: Conv, texts: string[]): void {
+    texts.forEach((text, i) => c.messages.push(this.msg(i % 2 ? "assistant" : "user", text)));
   }
 
   requests(method?: string, path?: string): Seen[] {
@@ -291,13 +302,15 @@ export class FakeChat {
       anonymous: who.anonymous,
       started,
       conversation: conv ? this.conversationJSON(conv) : null,
-      messages: conv ? conv.messages.slice(-100) : [],
+      messages: conv ? conv.messages.slice(-PAGE) : [],
+      has_more: conv ? conv.messages.length > PAGE : false,
       answering: conv ? conv.answering > 0 || conv.pending !== null : false,
     };
     if (this.saysFiles) {
       out.files = this.takes() ? { types: this.fileTypes, max_bytes: this.maxFileBytes, per_message: this.perMessage } : null;
     }
     if (this.contextMax !== null) out.context_max_bytes = this.contextMax;
+    if (this.conversationList !== null) out.conversation_list = this.conversationList;
     if (sessionToken) out.session_token = sessionToken;
     return json(200, out);
   }
@@ -324,37 +337,77 @@ export class FakeChat {
   }
 
   private latest(who: Identity): Conv | undefined {
-    let last: Conv | undefined;
-    for (const c of this.convs.values()) if (c.sub === who.sub && c.ext === who.ext) last = c;
-    return last;
+    return this.mine(who).find((c) => !c.ended);
+  }
+
+  // mine is the user's conversations in their scope, most recently active first.
+  private mine(who: Identity): Conv[] {
+    const active = (c: Conv) => (c.messages.length ? c.messages[c.messages.length - 1].id : 0);
+    const all = Array.from(this.convs.values()).filter((c) => c.sub === who.sub && c.ext === who.ext);
+    return all.reverse().sort((a, b) => active(b) - active(a));
+  }
+
+  // list answers the user's conversations a page at a time, after before's, each titled.
+  private list(who: Identity, before: string | null): Response {
+    if (!this.conversationList) return json(403, { error: "conversation_list_off", message: "This chat doesn't list conversations." });
+    const all = this.mine(who);
+    const from = before === null ? 0 : all.findIndex((c) => c.id === before) + 1;
+    if (!from && before !== null) return json(404, { error: "not_found", message: "No such conversation." });
+    const page = all.slice(from, from + PAGE).map((c) => ({ ...this.conversationJSON(c), title: titleOf(c) }));
+    return json(200, { conversations: page, has_more: all.length > from + PAGE });
   }
 
   private conversationJSON(c: Conv) {
-    return { id: c.id, created_at: "2026-11-15T00:00:00Z", updated_at: "2026-11-15T00:00:00Z" };
+    return { id: c.id, created_at: "2026-11-15T00:00:00Z", updated_at: "2026-11-15T00:00:00Z", ended_at: c.ended };
   }
 
-  private owned(who: Identity, id: string): Conv | Response {
+  // owned is the user's conversation, or 404: one they ended too where the chat lists none, but for ending it again.
+  private owned(who: Identity, id: string, evenEnded = false): Conv | Response {
     const c = this.convs.get(id);
-    if (!c || c.sub !== who.sub) return json(404, { error: "not_found", message: "No such conversation." });
+    if (!c || c.sub !== who.sub || (c.ended && !this.conversationList && !evenEnded)) {
+      return json(404, { error: "not_found", message: "No such conversation." });
+    }
     return c;
   }
 
-  private view(who: Identity, id: string): Response {
+  // end marks the user's conversation ended, answering 204 for one ended already.
+  private end(who: Identity, id: string): Response {
+    const c = this.owned(who, id, true);
+    if ("status" in c) return c;
+    if (!c.ended) c.ended = "2026-11-17T00:00:00Z";
+    return new Response(null, { status: 204 });
+  }
+
+  // remove deletes the user's conversation where the chat lists them, unless an answer is being written in it.
+  private remove(who: Identity, id: string): Response {
+    if (!this.conversationList) return json(403, { error: "conversation_list_off", message: "This chat doesn't list conversations." });
+    const c = this.owned(who, id);
+    if ("status" in c) return c;
+    if (c.answering > 0 || c.pending !== null) return json(409, { error: "busy", message: "An answer is being written in it." });
+    this.convs.delete(id);
+    return new Response(null, { status: 204 });
+  }
+
+  // view answers a conversation's last 20 messages, or the 20 before message before. Only
+  // reading the last moves a running answer on, as time would.
+  private view(who: Identity, id: string, before: string | null): Response {
     if (this.failViews > 0) {
       this.failViews--;
       throw new TypeError("network error");
     }
+    if (before !== null && !/^[1-9]\d*$/.test(before)) return json(400, { error: "bad_request", message: "before isn't a message id." });
     const c = this.owned(who, id);
     if ("status" in c) return c;
-    let answering = false;
-    if (c.answering > 0) {
+    let answering = c.answering > 0 || c.pending !== null;
+    if (before === null && c.answering > 0) {
       c.answering--;
-      answering = true;
-    } else if (c.pending !== null) {
+    } else if (before === null && c.pending !== null) {
       c.messages.push(this.msg("assistant", c.pending));
       c.pending = null;
+      answering = false;
     }
-    return json(200, { conversation: this.conversationJSON(c), messages: c.messages.slice(-100), answering });
+    const older = before === null ? c.messages : c.messages.filter((m) => m.id < Number(before));
+    return json(200, { conversation: this.conversationJSON(c), messages: older.slice(-PAGE), has_more: older.length > PAGE, answering });
   }
 
   private message(who: Identity, id: string | null, body: { text?: unknown; files?: unknown; context?: unknown } | undefined, signal?: AbortSignal | null): Response {
@@ -377,7 +430,7 @@ export class FakeChat {
       if ("status" in o) return o;
       c = o;
     } else {
-      c = { id: "c" + ++this.n, sub: who.sub, ext: who.ext, messages: [], answering: 0, pending: null };
+      c = { id: "c" + ++this.n, sub: who.sub, ext: who.ext, messages: [], answering: 0, pending: null, ended: null };
     }
     const running = Array.from(this.convs.values()).some((x) => x.sub === who.sub && (x.answering > 0 || x.pending !== null));
     if (running || Date.now() < this.busyUntil) return json(409, { error: "busy", message: "Still answering your previous message." });
@@ -386,6 +439,7 @@ export class FakeChat {
     if (files.length) user.files = files;
     for (const fl of files) this.files.get(fl.id)!.taken = true;
     c.messages.push(user);
+    c.ended = null; // the user's message reopens it
     if (this.internalAfterStore > 0) {
       this.internalAfterStore--;
       c.messages.push(this.msg("assistant", "Stored anyway"));
@@ -432,9 +486,9 @@ export class FakeChat {
     if (this.startPrompt === null) return json(403, { error: "start_not_allowed", message: "This chat doesn't start conversations itself." });
     const running = Array.from(this.convs.values()).some((x) => x.sub === who.sub && (x.answering > 0 || x.pending !== null));
     if (running || Date.now() < this.busyUntil) return json(409, { error: "busy", message: "Still answering your previous message." });
-    let c = this.startNew || fresh ? undefined : this.latest(who);
+    let c = fresh ? undefined : this.latest(who);
     if (!c) {
-      c = { id: "c" + ++this.n, sub: who.sub, ext: who.ext, messages: [], answering: 0, pending: null };
+      c = { id: "c" + ++this.n, sub: who.sub, ext: who.ext, messages: [], answering: 0, pending: null, ended: null };
       this.convs.set(c.id, c);
     }
     this.msgId++; // the start turn: stored, never shown
@@ -488,6 +542,12 @@ export const TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif", "app
 
 function fileJSON(s: Stored): FileJSON {
   return { id: s.id, name: s.name, type: s.type, size: s.size, created_at: s.created_at };
+}
+
+// titleOf is the start of c's first user message, its whitespace runs single spaces, at most 100 characters.
+function titleOf(c: Conv): string {
+  const first = c.messages.find((m) => m.role === "user");
+  return first ? Array.from(first.text.replace(/\s+/g, " ").trim()).slice(0, 100).join("") : "";
 }
 
 // sniff reads a file's type as the chat does: an image's or a PDF's signature,
