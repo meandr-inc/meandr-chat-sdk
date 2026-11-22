@@ -16,34 +16,35 @@ export interface Message {
   tools?: string[];
   toolTitles?: Record<string, string>; // with tools: each one's title by name, its name where the chat knows none
   files?: ChatFile[];
-  questions?: Question[]; // an answer's: what its tools asked the user
+  actions?: Action[]; // an answer's: what its tool calls waited on for the user
   createdAt: string;
 }
 
-export type QuestionStatus = "pending" | "answered" | "declined" | "cancelled" | "expired" | (string & {});
+export type ActionStatus = "pending" | "allow" | "deny" | "cancel" | "expired" | "aborted" | (string & {});
 
-// A tool's question for the user: a form (fields, {} for a confirmation) or pages to open (links).
-export interface Question {
+// What a tool call waits on from the user: a form (fields, {} for a confirmation) or pages to open (links).
+export interface Action {
   id: string;
+  initiator: "upstream" | "policy" | (string & {}); // a server's ask, or the workspace's approval of the call
   kind: "form" | "url" | (string & {});
-  server: string; // the asking server's name
+  server: string; // the server's name
   tool: string;
   title: string; // the tool's title, or its name
-  message: string; // a form's text, saying why it asks; plain text
+  message: string; // a form's text, saying why it asks, or an approval's summary; plain text
   fields: Record<string, unknown> | null; // a form's requestedSchema
-  links: QuestionLink[]; // a URL ask's pages
-  done: boolean; // a URL ask whose answer is the user's Done, once finished there, not the Open
-  status: QuestionStatus;
+  links: ActionLink[]; // a URL ask's pages
+  done: boolean; // a URL ask whose response is the user's Done, once finished there, not the Open
+  status: ActionStatus;
   expiresAt: string | null;
 }
 
-export interface QuestionLink {
+export interface ActionLink {
   url: string;
   message: string;
 }
 
-// The user's answer: content goes only with a form's accept, holding its fields.
-export interface QuestionAnswer {
+// The user's response: content goes only with a form's accept, holding its fields.
+export interface ActionResponse {
   action: "accept" | "decline" | "cancel";
   content?: Record<string, unknown>;
 }
@@ -77,7 +78,7 @@ export interface ToolProgress {
 export interface Answer {
   text: string;
   tools: readonly ToolProgress[];
-  questions?: readonly Question[]; // asked as the answer ends; done's message carries them too
+  actions?: readonly Action[]; // what its tool calls wait on, as they come; done's message keeps them
 }
 
 export type ChatStatus = "idle" | "opening" | "ready" | "error";
@@ -114,6 +115,8 @@ export type ListConversationsResult = { ok: true; conversations: Conversation[];
 export type OpenConversationResult = { ok: true; conversation: Conversation } | { ok: false; error: ChatError };
 
 export type DeleteConversationResult = { ok: true } | { ok: false; error: ChatError };
+
+export type RespondResult = { ok: true } | { ok: false; error: ChatError };
 
 export type LoadOlderResult = { ok: true; messages: Message[] } | { ok: false; error: ChatError };
 
@@ -187,13 +190,13 @@ export interface Chat {
   deleteConversation(conversation: Conversation | string): Promise<DeleteConversationResult>;
   /** Adds the 20 messages before the oldest shown, while hasOlder; calls while one runs share it. */
   loadOlder(): Promise<LoadOlderResult>;
-  /** Answers a tool's question in the conversation shown; it goes on, streamed as a message's answer is. */
-  answerQuestion(question: Question | string, answer: QuestionAnswer): Promise<SendResult>;
+  /** Sends the user's response to an action in the conversation shown, while the answer waiting on it streams. */
+  respondToAction(action: Action | string, response: ActionResponse): Promise<RespondResult>;
   /**
    * Opens one of a URL ask's pages in a new tab, never a frame; call it from the user's click. Without done,
-   * opening is the answer: it sends the accept and returns its result; with done, null (Done answers).
+   * opening is the response: it sends the accept and returns its result; with done, null (Done responds).
    */
-  openQuestionLink(question: Question, url: string): Promise<SendResult> | null;
+  openActionLink(action: Action, url: string): Promise<RespondResult> | null;
   reopen(options?: ReopenOptions): Promise<ChatState>;
   signOut(): Promise<void>;
   destroy(): void;

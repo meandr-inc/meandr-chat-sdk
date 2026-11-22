@@ -14,7 +14,7 @@ export type ChatErrorCode =
   | "conversation_list_off"
   | "not_found"
   | "busy"
-  | "question_closed"
+  | "action_closed"
   | "workspace_unavailable"
   | "too_large"
   | "unsupported_type"

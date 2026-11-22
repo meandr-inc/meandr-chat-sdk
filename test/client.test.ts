@@ -17,7 +17,7 @@ function ok(r: SendResult) {
   return r;
 }
 
-function err(r: SendResult) {
+function err(r: SendResult | { ok: true } | { ok: false; error: ChatError }) {
   if (r.ok) throw new Error("expected a failure");
   return r.error;
 }
@@ -2789,74 +2789,81 @@ describe("conversations", () => {
   });
 });
 
-describe("questions", () => {
+describe("actions", () => {
   const form = {
-    id: "a1", kind: "form", server: "Weather", tool: "forecast", title: "Forecast", message: "Which city?",
+    id: "a1", initiator: "upstream", kind: "form", server: "Weather", tool: "forecast", title: "Forecast", message: "Which city?",
     fields: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
     status: "pending", expires_at: "2026-11-22T12:00:00Z",
   };
   const url = {
-    id: "a2", kind: "url", server: "Keys", tool: "connect", title: "Connect",
+    id: "a2", initiator: "upstream", kind: "url", server: "Keys", tool: "connect", title: "Connect",
     links: [{ url: "https://keys.example/1", message: "Add your key" }], status: "pending",
   };
 
-  it("shows a tool's question as the answer ends, after its tool's waiting, and keeps it with the answer", async () => {
+  it("shows an action while its tool call waits, after the tool's waiting, its status as it changes, and keeps it with the answer", async () => {
     const { chat, fake, states } = setup({ token: ALICE });
-    fake.turns.push({ deltas: ["I've asked"], tools: [{ name: "forecast", status: "started", title: "Forecast" }], questions: [form] });
+    fake.turns.push({ deltas: ["Sunny"], tools: [{ name: "forecast", status: "started", title: "Forecast" }], actions: [form, { ...form, status: "allow" }] });
     const r = ok(await chat.send("Weather?"));
-    const asked = states.find((s) => s.answer && s.answer.questions && s.answer.questions.length);
-    expect(asked!.answer!.questions![0]).toMatchObject({ id: "a1", kind: "form", server: "Weather", message: "Which city?", status: "pending", expiresAt: "2026-11-22T12:00:00Z" });
-    expect(asked!.answer!.tools[asked!.answer!.tools.length - 1]).toMatchObject({ name: "forecast", status: "waiting", title: "Forecast" });
-    expect(r.message.questions![0]).toMatchObject({ id: "a1", fields: form.fields, links: [], done: false });
-    expect(chat.getState().messages[1].questions![0].status).toBe("pending");
+    const waiting = states.find((s) => s.answer && s.answer.actions && s.answer.actions.length && !s.answer.text);
+    expect(waiting!.answer!.actions![0]).toMatchObject({ id: "a1", initiator: "upstream", kind: "form", server: "Weather", message: "Which city?", status: "pending", expiresAt: "2026-11-22T12:00:00Z" });
+    expect(waiting!.answer!.tools[waiting!.answer!.tools.length - 1]).toMatchObject({ name: "forecast", status: "waiting", title: "Forecast" });
+    const decided = states.find((s) => s.answer && s.answer.actions && s.answer.actions[0].status === "allow");
+    expect(decided!.answer!.actions).toHaveLength(1);
+    expect(r.message.actions![0]).toMatchObject({ id: "a1", fields: form.fields, links: [], done: false, status: "allow" });
   });
 
-  it("answers one in the conversation shown, which goes on, and shows the user's choice", async () => {
+  it("sends the user's response to the conversation shown, and says one no longer pending is closed", async () => {
     const { chat, fake } = setup({ token: ALICE });
-    fake.turns.push({ questions: [form] });
+    fake.turns.push({ actions: [form] });
     ok(await chat.send("Weather?"));
-    fake.turns.push({ deltas: ["Sun", "ny"] });
-    const r = ok(await chat.answerQuestion("a1", { action: "accept", content: { city: "Narva" } }));
-    expect(r.message.text).toBe("Sunny");
     const conv = chat.getState().conversation!.id;
-    expect(fake.requests("POST", "/chat/v1/conversations/" + conv + "/questions/a1")[0].body).toEqual({ action: "accept", content: { city: "Narva" } });
-    expect(chat.getState().messages.map((m) => m.text)).toEqual(["Weather?", "Hello", "Sunny"]);
-    expect(chat.getState().messages[1].questions![0].status).toBe("answered");
-    expect(chat.getState()).toMatchObject({ answering: false, answer: null, error: null });
+    expect(await chat.respondToAction("a1", { action: "accept", content: { city: "Narva" } })).toEqual({ ok: true });
+    expect(fake.requests("POST", "/chat/v1/conversations/" + conv + "/actions/a1")[0].body).toEqual({ action: "accept", content: { city: "Narva" } });
+    expect(fake.responses.map((x) => x.body)).toEqual([{ action: "accept", content: { city: "Narva" } }]);
+    fake.convs.get(conv)!.messages[1].actions![0].status = "allow";
+    expect(err(await chat.respondToAction(chat.getState().messages[1].actions![0], { action: "decline" })).code).toBe("action_closed");
+    expect(err(await chat.respondToAction("a9", { action: "decline" })).code).toBe("not_found");
   });
 
-  it("says a question no longer pending is closed, and one elsewhere missing", async () => {
-    const { chat, fake } = setup({ token: ALICE });
-    fake.turns.push({ questions: [form] });
-    ok(await chat.send("Weather?"));
-    ok(await chat.answerQuestion(chat.getState().messages[1].questions![0], { action: "decline" }));
-    expect(fake.answers.map((a) => a.body)).toEqual([{ action: "decline" }]);
-    expect(err(await chat.answerQuestion("a1", { action: "accept", content: { city: "Narva" } })).code).toBe("question_closed");
-    expect(err(await chat.answerQuestion("a9", { action: "decline" })).code).toBe("not_found");
+  it("shows what an answer it follows waits on, from a page opened while it's written", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const first = setup({ token: ALICE }, fake);
+    ok(await first.chat.send("Weather?"));
+    const conv = first.chat.getState().conversation!.id;
+    const c = fake.convs.get(conv)!;
+    c.answering = 2;
+    c.waitingOn = [form];
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    expect(chat.getState()).toMatchObject({ answering: true });
+    expect(chat.getState().answer!.actions![0]).toMatchObject({ id: "a1", status: "pending" });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(chat.getState()).toMatchObject({ answering: false, answer: null });
   });
 
   it("checks what it's given before anything is sent", () => {
     const { chat } = setup({ token: ALICE });
-    expect(() => chat.answerQuestion("a1", { action: "maybe" } as never)).toThrow(TypeError);
-    expect(() => chat.answerQuestion("a1", { action: "accept", content: [] } as never)).toThrow(TypeError);
-    expect(() => chat.answerQuestion("", { action: "accept" })).toThrow(TypeError);
-    expect(() => chat.answerQuestion("a1", { action: "accept", other: 1 } as never)).toThrow(TypeError);
+    expect(() => chat.respondToAction("a1", { action: "maybe" } as never)).toThrow(TypeError);
+    expect(() => chat.respondToAction("a1", { action: "accept", content: [] } as never)).toThrow(TypeError);
+    expect(() => chat.respondToAction("", { action: "accept" })).toThrow(TypeError);
+    expect(() => chat.respondToAction("a1", { action: "accept", other: 1 } as never)).toThrow(TypeError);
   });
 
-  it("opens a URL ask's page from the click in a tab of its own, which answers it unless the user says Done", async () => {
+  it("opens a URL ask's page from the click in a tab of its own, which responds unless the user says Done", async () => {
     const open = vi.fn();
     vi.stubGlobal("window", { open });
     const { chat, fake } = setup({ token: ALICE });
-    fake.turns.push({ questions: [url] });
-    const q = ok(await chat.send("Connect it")).message.questions![0];
-    expect(q).toMatchObject({ kind: "url", links: [{ url: "https://keys.example/1", message: "Add your key" }], done: false, fields: null });
-    expect(() => chat.openQuestionLink(q, "https://elsewhere.example/")).toThrow(TypeError);
+    fake.turns.push({ actions: [url] });
+    const a = ok(await chat.send("Connect it")).message.actions![0];
+    expect(a).toMatchObject({ kind: "url", links: [{ url: "https://keys.example/1", message: "Add your key" }], done: false, fields: null });
+    expect(() => chat.openActionLink(a, "https://elsewhere.example/")).toThrow(TypeError);
     expect(open).not.toHaveBeenCalled();
-    ok(await chat.openQuestionLink(q, "https://keys.example/1")!);
+    expect(await chat.openActionLink(a, "https://keys.example/1")).toEqual({ ok: true });
     expect(open).toHaveBeenCalledWith("https://keys.example/1", "_blank", "noopener,noreferrer");
-    expect(fake.answers.map((a) => a.body)).toEqual([{ action: "accept" }]);
-    expect(chat.openQuestionLink({ ...q, done: true }, "https://keys.example/1")).toBeNull();
+    expect(fake.responses.map((x) => x.body)).toEqual([{ action: "accept" }]);
+    expect(chat.openActionLink({ ...a, done: true }, "https://keys.example/1")).toBeNull();
     expect(open).toHaveBeenCalledTimes(2);
-    expect(fake.answers).toHaveLength(1);
+    expect(fake.responses).toHaveLength(1);
   });
 });

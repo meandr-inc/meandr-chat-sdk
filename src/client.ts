@@ -19,11 +19,12 @@ import type {
   Message,
   OpenConversationResult,
   PageContext,
-  Question,
-  QuestionAnswer,
+  Action,
+  ActionResponse,
   ReadFileOptions,
   ReadFileResult,
   ReopenOptions,
+  RespondResult,
   SendOptions,
   SendResult,
   Stop,
@@ -40,6 +41,7 @@ interface Opened {
   messages: Message[];
   more_: boolean; // older messages remain
   answering: boolean;
+  actions_: Action[]; // what the answer being written waits on
   sessionToken_: string | null;
   files: FileLimits | null | undefined; // undefined from a chat that doesn't say
   contextMax_: number | undefined;
@@ -51,6 +53,7 @@ interface View {
   messages: Message[];
   more_: boolean;
   answering: boolean;
+  actions_: Action[];
 }
 
 interface Reply {
@@ -75,8 +78,8 @@ interface Unnamed {
 }
 
 const OPTIONS = ["url", "token", "tokenUrl", "getToken", "fetch", "context"];
-const EVENTS = ["conversation", "message", "delta", "tool", "question", "done", "error"];
-const ANSWERED: Record<string, string> = { accept: "answered", decline: "declined", cancel: "cancelled" };
+const EVENTS = ["conversation", "message", "delta", "tool", "action", "done", "error"];
+const RESPONSES = ["accept", "decline", "cancel"];
 const TRANSIENT = ["network", "internal", "rate_limited", "overloaded", "not_connected", "token_failed"];
 const ANSWER_CAP = 1 << 20; // characters of a streaming answer shown; done carries all of it
 const TOOLS_CAP = 100;
@@ -270,7 +273,7 @@ class Client implements Chat {
       if (move !== this.moves_ || version !== this.convVersion_) throw aborted();
       this.dropConversation_();
       this.seen_(v.messages);
-      this.set_({ ...this.shown_(v.conversation, v.messages, v.more_), outgoing: null, answer: null, answering: v.answering, waiting: null, stop: null, error: null });
+      this.set_({ ...this.shown_(v.conversation, v.messages, v.more_), outgoing: null, answer: pending(v.answering, v.actions_), answering: v.answering, waiting: null, stop: null, error: null });
       if (v.answering) this.watch_(v.conversation.id);
       return { ok: true, conversation: v.conversation };
     });
@@ -311,20 +314,27 @@ class Client implements Chat {
     return p;
   };
 
-  answerQuestion = (question: Question | string, answer: QuestionAnswer): Promise<SendResult> => {
-    const id = typeof question === "string" ? question : question && question.id;
-    if (typeof id !== "string" || id === "") throw new TypeError("expected a Question, or its id");
-    const a = checked(answer, ["action", "content"]);
-    if (!ANSWERED[a.action]) throw new TypeError("action must be accept, decline or cancel");
-    if (a.content !== undefined && (!a.content || typeof a.content !== "object" || Array.isArray(a.content))) throw new TypeError("content must be an object");
-    return this.doAnswer_(id, a.content === undefined ? { action: a.action } : { action: a.action, content: a.content });
+  respondToAction = (action: Action | string, response: ActionResponse): Promise<RespondResult> => {
+    const id = typeof action === "string" ? action : action && action.id;
+    if (typeof id !== "string" || id === "") throw new TypeError("expected an Action, or its id");
+    const r = checked(response, ["action", "content"]);
+    if (RESPONSES.indexOf(r.action) < 0) throw new TypeError("action must be accept, decline or cancel");
+    if (r.content !== undefined && (!r.content || typeof r.content !== "object" || Array.isArray(r.content))) throw new TypeError("content must be an object");
+    const body = r.content === undefined ? { action: r.action } : { action: r.action, content: r.content };
+    // The answer waiting on it goes on on its own stream; this only hands the response over.
+    return this.flow_(null, async (signal): Promise<RespondResult> => {
+      const c = this.state_.conversation;
+      if (!c) throw new ChatError("not_found", "No such action.");
+      discard(await this.retried_({ method: "POST", path: "/conversations/" + encodeURIComponent(c.id) + "/actions/" + encodeURIComponent(id), body }, signal));
+      return { ok: true };
+    });
   };
 
-  openQuestionLink = (question: Question, url: string): Promise<SendResult> | null => {
-    if (!question || !Array.isArray(question.links) || !question.links.some((l) => l.url === url)) throw new TypeError("url must be one of the question's links");
+  openActionLink = (action: Action, url: string): Promise<RespondResult> | null => {
+    if (!action || !Array.isArray(action.links) || !action.links.some((l) => l.url === url)) throw new TypeError("url must be one of the action's links");
     // Opened by the user's click alone, in a tab of its own that can't reach back.
     if (typeof window === "object" && window) window.open(url, "_blank", "noopener,noreferrer");
-    return question.kind === "url" && !question.done ? this.answerQuestion(question, { action: "accept" }) : null;
+    return action.kind === "url" && !action.done ? this.respondToAction(action, { action: "accept" }) : null;
   };
 
   reopen = (options?: ReopenOptions): Promise<ChatState> => {
@@ -464,7 +474,7 @@ class Client implements Chat {
       this.set_({ anonymous: o.anonymous, conversation: null, messages: [], hasOlder: false, answering: false });
       return;
     }
-    this.set_({ anonymous: o.anonymous, ...this.shown_(c, o.messages, o.more_), answering: o.answering });
+    this.set_({ anonymous: o.anonymous, ...this.shown_(c, o.messages, o.more_), answering: o.answering, answer: pending(o.answering, o.actions_) });
     if (o.answering) this.watch_(c.id);
   }
 
@@ -937,66 +947,6 @@ class Client implements Chat {
     }
   }
 
-  // doAnswer sends the user's answer to a question in the conversation shown and
-  // reads the answer that goes on from it, as a start's is read.
-  private async doAnswer_(id: string, a: QuestionAnswer): Promise<SendResult> {
-    if (this.dead_) return { ok: false, error: aborted() };
-    if (this.sending_ || this.state_.answering) return { ok: false, error: busy() };
-    const c = this.state_.conversation;
-    if (!c) return { ok: false, error: new ChatError("not_found", "No such question.") };
-    const mine = {};
-    this.sending_ = mine;
-    this.moves_++;
-    const scope = this.conv_;
-    let began = -1;
-    this.set_({ error: null, stop: null });
-    try {
-      began = this.convVersion_;
-      this.set_({ answering: true, answer: { text: "", tools: [] } });
-      const r = await cut(this.reply_(c.id, id, a, scope.signal), scope.signal);
-      return { ok: true, message: r.message, stop: r.stop };
-    } catch (e) {
-      return this.failed_(mine, scope, asChatError(e), began);
-    } finally {
-      if (this.sending_ === mine) this.sending_ = null;
-    }
-  }
-
-  // reply posts the answer; only refusals before the chat takes it are tried again, and
-  // once it has, the question shows the user's choice.
-  private async reply_(cid: string, id: string, a: QuestionAnswer, signal: AbortSignal): Promise<Reply> {
-    const sent: Sent = { text: "", files: [], target_: cid, known_: this.maxSeen_ };
-    const call = { method: "POST", path: "/conversations/" + encodeURIComponent(cid) + "/questions/" + encodeURIComponent(id), body: a, stream: true } as const;
-    const waitUntil = Date.now() + WAIT_CAP_MS;
-    const busyUntil = Date.now() + BUSY_CAP_MS;
-    for (let busyTries = 0; ; ) {
-      const stream = new AbortController();
-      const stop = () => stream.abort();
-      signal.addEventListener("abort", stop);
-      try {
-        const res = await this.authed_(call, stream.signal, cid);
-        if (res.ok) {
-          this.set_({ messages: withQuestion(this.state_.messages, id, ANSWERED[a.action]) });
-          return await this.read_(res, stream, signal, sent, null);
-        }
-        const err = await failure(res, signal);
-        this.forget_(cid, err);
-        const wait = waitFor(err);
-        if (wait !== null && Date.now() + wait <= waitUntil) {
-          await this.pause_(err.code, wait, signal);
-          continue;
-        }
-        if (err.code === "busy" && Date.now() < busyUntil) {
-          await this.pause_("busy", BUSY_STEPS_MS[Math.min(busyTries++, BUSY_STEPS_MS.length - 1)], signal);
-          continue;
-        }
-        throw err;
-      } finally {
-        signal.removeEventListener("abort", stop);
-      }
-    }
-  }
-
   // failed shows a failure. A message the page doesn't show as stored stays in
   // outgoing, so it can be sent again. began is the conversation version this
   // send set answering in; once the page shows another, answering is not its own.
@@ -1255,10 +1205,15 @@ class Client implements Chat {
         if (tools !== a.tools) this.set_({ answer: { ...a, tools } });
         return null;
       }
-      case "question": {
+      case "action": {
+        // A tool call waits on it, or its status changed: the latest of each id shows.
         const a = this.state_.answer || { text: "", tools: [] };
-        const q = questionOf(o);
-        if (q) this.set_({ answer: { ...a, questions: (a.questions || []).filter((x) => x.id !== q.id).concat(q) } });
+        const x = actionOf(o);
+        if (x) {
+          const list = a.actions || [];
+          const i = list.findIndex((y) => y.id === x.id);
+          this.set_({ answer: { ...a, actions: i < 0 ? list.concat(x) : list.map((y, j) => (j === i ? x : y)) } });
+        }
         return null;
       }
       case "done": {
@@ -1348,10 +1303,14 @@ class Client implements Chat {
       }
       failures = 0;
       live(signal);
-      if (v.answering) continue;
+      if (v.answering) {
+        // What the answer's tool calls wait on shows while it's written elsewhere.
+        if (this.current_(id) && v.actions_.length) this.set_({ answer: pending(true, v.actions_) });
+        continue;
+      }
       if (this.current_(id)) {
         this.seen_(v.messages);
-        this.set_({ ...this.shown_(v.conversation, v.messages, v.more_), answering: false });
+        this.set_({ ...this.shown_(v.conversation, v.messages, v.more_), answer: null, answering: false });
       }
       return v;
     }
@@ -1528,7 +1487,7 @@ function merge(old: readonly Message[], fresh: Message[]): Message[] {
   return fresh.map((m) => {
     const o = byId.get(m.id);
     const same = o && o.text === m.text && o.role === m.role && o.createdAt === m.createdAt && String(o.tools) === String(m.tools);
-    return same && JSON.stringify([o.files, o.questions]) === JSON.stringify([m.files, m.questions]) ? o : m;
+    return same && JSON.stringify([o.files, o.actions]) === JSON.stringify([m.files, m.actions]) ? o : m;
   });
 }
 
@@ -1586,12 +1545,16 @@ function messageOf(v: unknown): Message {
     );
   }
   if (Array.isArray(o.files)) m.files = o.files.filter((f) => f && typeof f.id === "string").map(fileOf);
-  if (Array.isArray(o.questions)) m.questions = o.questions.map(questionOf).filter((q): q is Question => q !== null);
+  if (Array.isArray(o.actions)) m.actions = actionsOf(o.actions);
   return m;
 }
 
-// questionOf reads a tool's question; one without an id or a kind is skipped.
-function questionOf(v: unknown): Question | null {
+function actionsOf(v: unknown): Action[] {
+  return Array.isArray(v) ? v.map(actionOf).filter((a): a is Action => a !== null) : [];
+}
+
+// actionOf reads an action a tool call waits on; one without an id or a kind is skipped.
+function actionOf(v: unknown): Action | null {
   const o = v as Record<string, unknown> | null;
   if (!o || typeof o !== "object" || typeof o.id !== "string" || typeof o.kind !== "string") return null;
   const str = (k: string) => (typeof o[k] === "string" ? (o[k] as string) : "");
@@ -1601,6 +1564,7 @@ function questionOf(v: unknown): Question | null {
     : [];
   return {
     id: o.id,
+    initiator: str("initiator") || "upstream",
     kind: o.kind,
     server: str("server"),
     tool: str("tool"),
@@ -1612,13 +1576,6 @@ function questionOf(v: unknown): Question | null {
     status: str("status") || "pending",
     expiresAt: str("expires_at") || null,
   };
-}
-
-// withQuestion shows question id with status wherever a message holds it.
-function withQuestion(list: readonly Message[], id: string, status: string): Message[] {
-  return list.map((m) =>
-    m.questions && m.questions.some((q) => q.id === id) ? { ...m, questions: m.questions.map((q) => (q.id === id ? { ...q, status } : q)) } : m,
-  );
 }
 
 function fileOf(v: unknown): ChatFile {
@@ -1644,6 +1601,7 @@ function openedOf(v: unknown): Opened {
     messages: messagesOf(o.messages),
     more_: o.has_more === true,
     answering: o.answering === true,
+    actions_: actionsOf(o.actions),
     sessionToken_: typeof o.session_token === "string" && o.session_token !== "" ? o.session_token : null,
     files: limitsOf(o.files),
     contextMax_: typeof o.context_max_bytes === "number" ? o.context_max_bytes : undefined,
@@ -1663,5 +1621,16 @@ function limitsOf(v: unknown): FileLimits | null | undefined {
 function viewOf(v: unknown): View {
   const o = v as Record<string, unknown> | null;
   if (!o || typeof o !== "object") throw bad("conversation");
-  return { conversation: conversationOf(o.conversation), messages: messagesOf(o.messages), more_: o.has_more === true, answering: o.answering === true };
+  return {
+    conversation: conversationOf(o.conversation),
+    messages: messagesOf(o.messages),
+    more_: o.has_more === true,
+    answering: o.answering === true,
+    actions_: actionsOf(o.actions),
+  };
+}
+
+// pending is the answer a page follows but didn't start, holding what its tool calls wait on.
+function pending(answering: boolean, actions: Action[]): { text: string; tools: never[]; actions: Action[] } | null {
+  return answering && actions.length ? { text: "", tools: [], actions } : null;
 }
