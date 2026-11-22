@@ -195,6 +195,7 @@ export interface Chat {
   /**
    * Opens one of a URL ask's pages in a new tab, never a frame; call it from the user's click. Without done,
    * opening is the response: it sends the accept and returns its result; with done, null (Done responds).
+   * A link that isn't http or https opens nothing and resolves bad_request.
    */
   openActionLink(action: Action, url: string): Promise<RespondResult> | null;
   reopen(options?: ReopenOptions): Promise<ChatState>;

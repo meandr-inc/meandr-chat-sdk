@@ -91,7 +91,7 @@ const BUSY_STEPS_MS = [2_000, 3_000, 5_000, 8_000, 10_000];
 const LOOKUP_STEPS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
 const POLL_MS = 3_000;
 const POLL_SLOW_MS = 10_000;
-const POLL_CAP_MS = 600_000;
+const POLL_CAP_MS = 16 * 60_000; // past the chat's 15-minute cap on an answer
 const POLL_FAILURES = 20;
 // Opening tries again briskly through the first minute, then every 15 to 30 s:
 // a restarting chat answers through hops the browser shows as network errors.
@@ -332,6 +332,7 @@ class Client implements Chat {
 
   openActionLink = (action: Action, url: string): Promise<RespondResult> | null => {
     if (!action || !Array.isArray(action.links) || !action.links.some((l) => l.url === url)) throw new TypeError("url must be one of the action's links");
+    if (!/^https?:\/\//i.test(url)) return Promise.resolve({ ok: false, error: new ChatError("bad_request", "Only an http or https link opens.") });
     // Opened by the user's click alone, in a tab of its own that can't reach back.
     if (typeof window === "object" && window) window.open(url, "_blank", "noopener,noreferrer");
     return action.kind === "url" && !action.done ? this.respondToAction(action, { action: "accept" }) : null;
@@ -1304,8 +1305,8 @@ class Client implements Chat {
       failures = 0;
       live(signal);
       if (v.answering) {
-        // What the answer's tool calls wait on shows while it's written elsewhere.
-        if (this.current_(id) && v.actions_.length) this.set_({ answer: pending(true, v.actions_) });
+        // What the answer's tool calls wait on shows while it's written elsewhere, beside what was streamed.
+        if (this.current_(id) && v.actions_.length) this.set_({ answer: { text: "", tools: [], ...this.state_.answer, actions: v.actions_ } });
         continue;
       }
       if (this.current_(id)) {
@@ -1329,7 +1330,7 @@ class Client implements Chat {
       .then(
         () => {},
         () => {
-          if (!w.signal.aborted && this.current_(id)) this.set_({ answering: false });
+          if (!w.signal.aborted && this.current_(id)) this.set_({ answer: null, answering: false });
         },
       )
       .then(() => {
@@ -1495,12 +1496,13 @@ function withMessage(list: readonly Message[], m: Message): Message[] {
   return list.some((x) => x.id === m.id) ? list.map((x) => (x.id === m.id ? m : x)) : list.concat(m);
 }
 
-// withTool records a tool's progress, titled with its name when the chat gives no title: an end updates
-// the call it ends, keeping its title, and the list holds at most TOOLS_CAP calls, answering tools itself when full.
+// withTool records a tool's progress, titled with its name when the chat gives no title: a waiting or an end updates
+// the latest call of that name not ended, keeping its title; at most TOOLS_CAP calls, answering tools itself when full.
 function withTool(tools: Answer["tools"], name: string, status: string, title: string): Answer["tools"] {
   if (status !== "started") {
     for (let i = tools.length - 1; i >= 0; i--) {
-      if (tools[i].name === name && tools[i].status === "started") {
+      const s = tools[i].status;
+      if (tools[i].name === name && (s === "started" || s === "waiting")) {
         return tools.slice(0, i).concat({ name, status, title: title || tools[i].title }, tools.slice(i + 1));
       }
     }
