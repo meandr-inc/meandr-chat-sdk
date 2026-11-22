@@ -106,7 +106,7 @@ can't silently resume someone's session.
 | `deleteConversation(conversation)` | deletes that conversation, a Conversation or its id, with its messages and files, opening the session if need be. One already gone counts as deleted; the one shown is forgotten. Resolves with `{ ok: true }` or `{ ok: false, error }`, and is refused as `busy` while an answer is being written in it |
 | `loadOlder()` | adds the 20 messages before the oldest shown to the front of `messages`, while `hasOlder`. Resolves with `{ ok: true, messages }`, those it added, or `{ ok: false, error }` |
 | `respondToAction(action, { action, content })` | sends the user's response to an action in the conversation shown, an Action or its id, while the answer waiting on it streams: see [Actions](#actions). `action` is `"accept"`, `"decline"` or `"cancel"`; `content`, a form's fields, goes only with a form's accept. Resolves with `{ ok: true }` or `{ ok: false, error }` |
-| `openActionLink(action, url)` | opens one of a URL ask's pages in a new tab, never in a frame: call it from the user's click. Without `done`, opening is the response: it also sends the accept and returns `respondToAction`'s promise; with `done`, it returns `null`, and Done responds |
+| `openActionLink(action, url)` | opens one of a URL ask's pages in a new tab, never in a frame: call it from the user's click. Without `done`, opening is the response: it also sends the accept and returns `respondToAction`'s promise; with `done`, it returns `null`, and Done responds. A link that isn't `http:` or `https:` opens nothing and resolves `{ ok: false, error }` with `bad_request` |
 | `reopen({ token })` | the user changed without a page load: signed in, signed out or switched team. Forgets everything shown and, if the chat was open, opens it again. Pass `token` when you give `token` |
 | `signOut()` | ends the session and forgets the user, even if the page never showed the chat. Call it from your sign-out and await it before you navigate: it settles within three seconds, and never rejects |
 | `destroy()` | stops everything this client does; it sends nothing more |
@@ -228,7 +228,8 @@ done.onclick = () => chat.respondToAction(a, { action: "accept" }); // shown onl
   fields it's a confirmation: Confirm and Decline alone. The fields go to the tool alone, never the model.
 - **A URL ask** shows each link's `message` and its whole URL, the host prominent, never fetched or previewed, with
   Open. `openActionLink` opens the page in a new tab with `noopener`, from the user's click so no popup blocker
-  stops it. Without `done`, agreeing to open the page is the response: Open sends it. With `done`, the tool must be
+  stops it; it opens only `http:` and `https:` links, and resolves any other as `bad_request`, sending nothing.
+  Without `done`, agreeing to open the page is the response: Open sends it. With `done`, the tool must be
   called again once the user has finished there, so offer Done once a page has been opened; Done responds. Warn of a
   host in Punycode (`xn--`).
 - **Decline** declines; `cancel` says the user made no choice.
@@ -372,7 +373,8 @@ Codes the client doesn't know may come: show a general error for those.
   since the chat may have kept it: attach it again. An upload is given up on when it stops moving for 30 s, or, without
   `onProgress`, when no answer starts within 30 s plus its size's time at 32 KB/s.
 - **A lost stream:** the answer runs on and is stored. The client asks for the conversation every few seconds, for up
-  to ten minutes, until the answer ends, as it does when it opens on an answer a previous page left running. An answer
+  to 16 minutes, past the chat's 15 for an answer, until the answer ends, as it does when it opens on an answer a
+  previous page left running; the text and tools already shown stay until the stored answer replaces them. An answer
   still waiting its turn when its stream closed was dropped: that's `no_answer`, and sending again stores the message
   a second time.
 

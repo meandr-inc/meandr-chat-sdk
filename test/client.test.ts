@@ -2812,6 +2812,50 @@ describe("actions", () => {
     expect(r.message.actions![0]).toMatchObject({ id: "a1", fields: form.fields, links: [], done: false, status: "allow" });
   });
 
+  it("moves a tool call from started through waiting to done as one entry, and a second waiting changes nothing", async () => {
+    const { chat, fake, states } = setup({ token: ALICE });
+    const started = { name: "forecast", status: "started", title: "Forecast" };
+    fake.turns.push({ deltas: ["Sunny"], tools: [started], actions: [form, { ...form, status: "allow" }], toolsAfter: [{ ...started, status: "done" }] });
+    ok(await chat.send("Weather?"));
+    const streamed = states.filter((s) => s.answer && s.answer.text === "Sunny").pop()!;
+    expect(streamed.answer!.tools).toEqual([{ name: "forecast", status: "done", title: "Forecast" }]);
+
+    fake.turns.push({ deltas: ["Sunny"], tools: [started], actions: [form, { ...form, id: "a3" }] });
+    ok(await chat.send("Again?"));
+    const again = states.filter((s) => s.answer && s.answer.text === "Sunny").pop()!;
+    expect(again.answer!.tools).toEqual([{ name: "forecast", status: "waiting", title: "Forecast" }]);
+  });
+
+  it("keeps the text and tools shown while it follows a lost stream that waits on an action", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    fake.turns.push({ deltas: ["Hel"], text: "Hello there", tools: [{ name: "forecast", status: "started", title: "Forecast" }], actions: [form], drop: "after-deltas", pollsAnswering: 2 });
+    const { chat } = setup({ token: ALICE }, fake);
+    const p = chat.send("Weather?");
+    await vi.advanceTimersByTimeAsync(3_500);
+    expect(fake.requests("GET").filter((s) => s.path.startsWith("/chat/v1/conversations/"))).toHaveLength(1);
+    expect(chat.getState()).toMatchObject({ answering: true, answer: { text: "Hel", tools: [{ name: "forecast", status: "waiting" }], actions: [{ id: "a1", status: "pending" }] } });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(ok(await p).message.text).toBe("Hello there");
+    expect(chat.getState()).toMatchObject({ answering: false, answer: null });
+  });
+
+  it("follows an answer past ten minutes, and one given up on past sixteen leaves nothing pending", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const first = setup({ token: ALICE }, fake);
+    ok(await first.chat.send("Weather?"));
+    const c = fake.convs.get(first.chat.getState().conversation!.id)!;
+    c.answering = 100_000;
+    c.waitingOn = [form];
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    await vi.advanceTimersByTimeAsync(11 * 60_000);
+    expect(chat.getState()).toMatchObject({ answering: true, answer: { actions: [{ id: "a1", status: "pending" }] } });
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+    expect(chat.getState()).toMatchObject({ answering: false, answer: null });
+  });
+
   it("sends the user's response to the conversation shown, and says one no longer pending is closed", async () => {
     const { chat, fake } = setup({ token: ALICE });
     fake.turns.push({ actions: [form] });
@@ -2865,5 +2909,21 @@ describe("actions", () => {
     expect(chat.openActionLink({ ...a, done: true }, "https://keys.example/1")).toBeNull();
     expect(open).toHaveBeenCalledTimes(2);
     expect(fake.responses).toHaveLength(1);
+  });
+
+  it("opens only an http or https link, refusing any other without opening or sending anything", async () => {
+    const open = vi.fn();
+    vi.stubGlobal("window", { open });
+    const { chat, fake } = setup({ token: ALICE });
+    fake.turns.push({ actions: [url] });
+    const a = ok(await chat.send("Connect it")).message.actions![0];
+    for (const bad of ["javascript:alert(1)", "data:text/html,<b>x</b>", " https://keys.example/", "//keys.example/", "vbscript:x"]) {
+      const r = await chat.openActionLink({ ...a, links: [{ url: bad, message: "" }] }, bad);
+      expect(err(r!).code).toBe("bad_request");
+    }
+    expect(open).not.toHaveBeenCalled();
+    expect(fake.responses).toHaveLength(0);
+    expect(await chat.openActionLink({ ...a, links: [{ url: "HTTP://keys.example/2", message: "" }] }, "HTTP://keys.example/2")).toEqual({ ok: true });
+    expect(open).toHaveBeenCalledTimes(1);
   });
 });

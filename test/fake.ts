@@ -64,6 +64,7 @@ export interface Turn {
   pollsAnswering?: number;
   extra?: string;
   actions?: ActionJSON[]; // what its tool calls wait on, as they come: an id again is a status change
+  toolsAfter?: Array<{ name: string; status: string; title?: string }>; // tool events after the actions, such as a waiting tool's done
 }
 
 export interface Refusal {
@@ -483,6 +484,7 @@ export class FakeChat {
       parts.push(ev("action", a));
       kept.set(a.id, a);
     }
+    for (const t of turn.toolsAfter || []) parts.push(ev("tool", t));
     for (const d of deltas) parts.push(ev("delta", { text: d }));
     if (turn.drop === "after-deltas") return stream(parts, "drop", signal, () => this.runOn(c, answer, turn));
     if (turn.stall) return stream(parts, "stall", signal, () => this.runOn(c, answer, turn));
@@ -548,6 +550,7 @@ export class FakeChat {
   private runOn(c: Conv, answer: string, turn: Turn): void {
     c.answering = turn.pollsAnswering === undefined ? 1 : turn.pollsAnswering;
     c.pending = answer;
+    if (turn.actions) c.waitingOn = turn.actions;
   }
 
   // upload keeps a file for its visitor's next message, its type read from its bytes.
