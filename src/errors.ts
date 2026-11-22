@@ -14,6 +14,8 @@ export type ChatErrorCode =
   | "conversation_list_off"
   | "not_found"
   | "busy"
+  | "action_closed"
+  | "workspace_unavailable"
   | "too_large"
   | "unsupported_type"
   | "rate_limited"
@@ -50,6 +52,7 @@ const RETRYABLE = new Set([
   "network",
   "internal",
   "token_failed",
+  "workspace_unavailable",
 ]);
 
 // ChatError carries the chat's error code or one of the client's own; see the

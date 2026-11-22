@@ -8,7 +8,17 @@ interface Message {
   tools?: string[];
   tool_titles?: Record<string, string>;
   files?: FileJSON[];
+  actions?: ActionJSON[];
   created_at: string;
+}
+
+export interface ActionJSON {
+  id: string;
+  kind: string;
+  tool: string;
+  title: string;
+  status: string;
+  [key: string]: unknown;
 }
 
 export interface FileJSON {
@@ -53,6 +63,7 @@ export interface Turn {
   stall?: boolean;
   pollsAnswering?: number;
   extra?: string;
+  actions?: ActionJSON[]; // what its tool calls wait on, as they come: an id again is a status change
 }
 
 export interface Refusal {
@@ -90,6 +101,7 @@ interface Conv {
   answering: number;
   pending: string | null;
   ended: string | null;
+  waitingOn?: ActionJSON[]; // what the answer being written waits on, while answering
 }
 
 interface Identity {
@@ -144,6 +156,7 @@ export class FakeChat {
   contextMax: number | null = 8 << 10; // CHAT_PAGE_CONTEXT_KIB; null plays a chat from before page context
   conversationList: boolean | null = false; // CHAT_CONVERSATION_LIST; null plays a chat from before the list
   files = new Map<string, Stored>();
+  responses: Array<{ action: string; body: unknown }> = [];
   private n = 0;
   private msgId = 0;
 
@@ -183,6 +196,11 @@ export class FakeChat {
     if (method === "POST" && path === "/chat/v1/start") {
       const who = this.identify(bearer);
       return "status" in who ? who : this.startTurn(who, (body || {}) as { new?: boolean; context?: unknown }, init.signal);
+    }
+    const q = /^\/chat\/v1\/conversations\/([^/?]+)\/actions\/([^/?]+)$/.exec(path);
+    if (q && method === "POST") {
+      const who = this.identify(bearer);
+      return "status" in who ? who : this.respond(who, decodeURIComponent(q[1]), decodeURIComponent(q[2]), body);
     }
     const m = /^\/chat\/v1\/conversations(?:\/([^/?]+)(\/messages|\/end)?)?(?:\?(.*))?$/.exec(path);
     if (m) {
@@ -306,6 +324,7 @@ export class FakeChat {
       has_more: conv ? conv.messages.length > PAGE : false,
       answering: conv ? conv.answering > 0 || conv.pending !== null : false,
     };
+    if (out.answering && conv && conv.waitingOn && conv.waitingOn.length) out.actions = conv.waitingOn;
     if (this.saysFiles) {
       out.files = this.takes() ? { types: this.fileTypes, max_bytes: this.maxFileBytes, per_message: this.perMessage } : null;
     }
@@ -407,7 +426,9 @@ export class FakeChat {
       answering = false;
     }
     const older = before === null ? c.messages : c.messages.filter((m) => m.id < Number(before));
-    return json(200, { conversation: this.conversationJSON(c), messages: older.slice(-PAGE), has_more: older.length > PAGE, answering });
+    const out: Record<string, unknown> = { conversation: this.conversationJSON(c), messages: older.slice(-PAGE), has_more: older.length > PAGE, answering };
+    if (answering && before === null && c.waitingOn && c.waitingOn.length) out.actions = c.waitingOn;
+    return json(200, out);
   }
 
   private message(who: Identity, id: string | null, body: { text?: unknown; files?: unknown; context?: unknown } | undefined, signal?: AbortSignal | null): Response {
@@ -455,6 +476,13 @@ export class FakeChat {
     if (turn.extra) parts.push(turn.extra);
     if (turn.drop === "after-message") return stream(parts, "drop", signal, () => this.runOn(c, answer, turn));
     for (const t of turn.tools || []) parts.push(ev("tool", t));
+    // What the tool call waits on comes while it waits, before the answer goes on.
+    const kept = new Map<string, ActionJSON>();
+    for (const a of turn.actions || []) {
+      if (!kept.has(a.id)) parts.push(ev("tool", { name: a.tool, status: "waiting", title: a.title }));
+      parts.push(ev("action", a));
+      kept.set(a.id, a);
+    }
     for (const d of deltas) parts.push(ev("delta", { text: d }));
     if (turn.drop === "after-deltas") return stream(parts, "drop", signal, () => this.runOn(c, answer, turn));
     if (turn.stall) return stream(parts, "stall", signal, () => this.runOn(c, answer, turn));
@@ -471,10 +499,23 @@ export class FakeChat {
     const stored = this.msg("assistant", answer);
     if (turn.tools) stored.tools = turn.tools.filter((t) => t.status === "started").map((t) => t.name);
     for (const t of turn.tools || []) if (t.title) stored.tool_titles = { ...stored.tool_titles, [t.name]: t.title };
+    if (kept.size) stored.actions = Array.from(kept.values()).map((a) => ({ ...a }));
     c.messages.push(stored);
     parts.push(": keep-alive\n\n");
     parts.push(ev("done", { message: stored, stop: turn.stop || "end" }));
     return stream(parts, "close", signal);
+  }
+
+  // respond takes the user's response to an action in their conversation, as server.go's
+  // respondToAction: handed to the workspace, 202, while any answer goes on.
+  private respond(who: Identity, id: string, aid: string, body: unknown): Response {
+    const c = this.owned(who, id);
+    if ("status" in c) return c;
+    const a = c.messages.flatMap((m) => m.actions || []).concat(c.waitingOn || []).find((x) => x.id === aid);
+    if (!a) return json(404, { error: "not_found", message: "No such action." });
+    if (a.status !== "pending") return json(409, { error: "action_closed", message: "This action is " + a.status + "." });
+    this.responses.push({ action: aid, body });
+    return new Response(null, { status: 202 });
   }
 
   // startTurn has the assistant speak first, as server.go's pageStart: the

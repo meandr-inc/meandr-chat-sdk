@@ -2,6 +2,10 @@ export { createChat } from "./client.js";
 export { ChatError, isChatError } from "./errors.js";
 export type { ChatErrorCode } from "./errors.js";
 export type {
+  Action,
+  ActionLink,
+  ActionResponse,
+  ActionStatus,
   Answer,
   AttachOptions,
   AttachResult,
@@ -22,6 +26,7 @@ export type {
   ReadFileOptions,
   ReadFileResult,
   ReopenOptions,
+  RespondResult,
   SendOptions,
   SendResult,
   Stop,

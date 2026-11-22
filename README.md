@@ -105,14 +105,16 @@ can't silently resume someone's session.
 | `openConversation(conversation)` | shows that conversation, a Conversation or its id, in place of the current one once it's read: its last 20 messages. It ends nothing, and the next message goes there. Resolves with `{ ok: true, conversation }`, or `{ ok: false, error }` with the current one still shown |
 | `deleteConversation(conversation)` | deletes that conversation, a Conversation or its id, with its messages and files, opening the session if need be. One already gone counts as deleted; the one shown is forgotten. Resolves with `{ ok: true }` or `{ ok: false, error }`, and is refused as `busy` while an answer is being written in it |
 | `loadOlder()` | adds the 20 messages before the oldest shown to the front of `messages`, while `hasOlder`. Resolves with `{ ok: true, messages }`, those it added, or `{ ok: false, error }` |
+| `respondToAction(action, { action, content })` | sends the user's response to an action in the conversation shown, an Action or its id, while the answer waiting on it streams: see [Actions](#actions). `action` is `"accept"`, `"decline"` or `"cancel"`; `content`, a form's fields, goes only with a form's accept. Resolves with `{ ok: true }` or `{ ok: false, error }` |
+| `openActionLink(action, url)` | opens one of a URL ask's pages in a new tab, never in a frame: call it from the user's click. Without `done`, opening is the response: it also sends the accept and returns `respondToAction`'s promise; with `done`, it returns `null`, and Done responds |
 | `reopen({ token })` | the user changed without a page load: signed in, signed out or switched team. Forgets everything shown and, if the chat was open, opens it again. Pass `token` when you give `token` |
 | `signOut()` | ends the session and forgets the user, even if the page never showed the chat. Call it from your sign-out and await it before you navigate: it settles within three seconds, and never rejects |
 | `destroy()` | stops everything this client does; it sends nothing more |
 
 No member rejects for a chat failure: the result and the state carry it. Members work passed around on their own, as
 in `onClick={chat.endConversation}` or `onFocus={chat.open}`; `send`, `attach`, `readFile`, `listConversations`,
-`openConversation`, `deleteConversation` and `reopen` take arguments, so call those yourself rather than handing them
-an event.
+`openConversation`, `deleteConversation`, `respondToAction`, `openActionLink` and `reopen` take arguments, so call
+those yourself rather than handing them an event.
 
 ## The state
 
@@ -121,10 +123,10 @@ an event.
 | `status` | `"idle"` before opening, `"opening"`, `"ready"`, or `"error"` when opening failed (`error` says why) |
 | `anonymous` | whether the session is an anonymous visitor's; `null` before opening |
 | `conversation` | `{ id, createdAt, updatedAt, endedAt }`, or `null` before the first message. `endedAt` is when the user ended it, `null` while they haven't; their next message there reopens it |
-| `messages` | the conversation's stored messages, oldest first: its last 20 when it's shown, and older ones as `loadOlder()` adds them. Each is `{ id, role, text, tools?, toolTitles?, files?, createdAt }`. `tools` names the tools the answer used, and `toolTitles`, with it, gives each one's title by name, its name where the chat knows none; `files` are the ChatFiles the visitor attached |
+| `messages` | the conversation's stored messages, oldest first: its last 20 when it's shown, and older ones as `loadOlder()` adds them. Each is `{ id, role, text, tools?, toolTitles?, files?, actions?, createdAt }`. `tools` names the tools the answer used, and `toolTitles`, with it, gives each one's title by name, its name where the chat knows none; `files` are the ChatFiles the visitor attached; `actions`, on an answer, what its tool calls waited on (see [Actions](#actions)) |
 | `hasOlder` | the conversation shown has messages older than those in `messages`: `loadOlder()` adds them |
 | `outgoing` | the text of the message being sent, `""` with files alone, until the page shows it stored. With `error` set, it may not have reached the chat: offer to send it again, with its files, which never stores it twice |
-| `answer` | the answer being written in this page: `{ text, tools: [{ name, status, title }] }`, or `null`. Show a tool's `title`: its name when the chat knows none |
+| `answer` | the answer being written in this page: `{ text, tools: [{ name, status, title }], actions? }`, or `null`. Show a tool's `title`: its name when the chat knows none. A tool `"waiting"` waits on the user's response to an action, which `actions` carries |
 | `answering` | an answer is being written in this conversation: in this page, or one the page lost or a previous page left running |
 | `waiting` | `{ code, until }` while the client waits by itself, such as `rate_limited`, or `null`. `until` is a time in milliseconds, as from `Date.now()` |
 | `stop` | why the last answer ended: `"end"`, `"max_tokens"` (cut short), `"refusal"` or `"paused"`; `null` when unknown |
@@ -194,6 +196,46 @@ scroller.onscroll = () => {
 - **`start()`** speaks in the user's latest conversation they haven't ended, which may not be the one shown: the page
   then shows that conversation, with the answer alone. With none shown, after `endConversation()` say, it speaks in a
   new one.
+
+## Actions
+
+A tool call may need the user before it can go on: a confirmation, a few fields, or a page of its own, such as one for
+a key. The workspace holds the call while the model waits on it, and the chat shows the action in the answer being
+written, at the tool that waits. Once the user responds, the tool's result reaches the model and the answer goes on,
+in the same turn, on the same stream.
+
+```js
+for (const a of state.answer?.actions || message.actions || []) {
+  if (a.status !== "pending") showStatus(a); // allow, deny, cancel, expired or aborted
+  else if (a.kind === "form") showForm(a);   // a.message, then a.fields; {} is a confirmation
+  else showLinks(a);                         // a.links: [{ url, message }]
+}
+
+confirm.onclick = () => chat.respondToAction(a, { action: "accept", content: values }); // a form's fields
+decline.onclick = () => chat.respondToAction(a, { action: "decline" });
+link.onclick = () => chat.openActionLink(a, link.dataset.url); // from the click; without done, the response
+done.onclick = () => chat.respondToAction(a, { action: "accept" }); // shown only when a.done
+```
+
+- **An Action** is `{ id, initiator, kind, server, tool, title, message, fields, links, done, status, expiresAt }`. Show
+  who asks, the server's name and the tool's title, beside it. `initiator` is `"upstream"`, a server's ask, or
+  `"policy"`, the workspace's approval of the call.
+- **While the answer is written** `answer.actions` holds them, each as it comes and again as its status changes; the
+  stored answer keeps them as `message.actions`. A page opened meanwhile shows them while it follows the answer.
+- **A form** shows `message` as plain text, making no link in it clickable, then each field of `fields`, a JSON
+  Schema's flat object of strings, numbers, integers, booleans and single or multiple choices, each with its `title`,
+  `description` and `default`, filled in for the user to review. `required` names those that must be filled. With no
+  fields it's a confirmation: Confirm and Decline alone. The fields go to the tool alone, never the model.
+- **A URL ask** shows each link's `message` and its whole URL, the host prominent, never fetched or previewed, with
+  Open. `openActionLink` opens the page in a new tab with `noopener`, from the user's click so no popup blocker
+  stops it. Without `done`, agreeing to open the page is the response: Open sends it. With `done`, the tool must be
+  called again once the user has finished there, so offer Done once a page has been opened; Done responds. Warn of a
+  host in Punycode (`xn--`).
+- **Decline** declines; `cancel` says the user made no choice.
+- **`respondToAction`** hands the response over and resolves `{ ok: true }`; what follows comes on the answer's own
+  stream. The tool's result can come minutes after a URL ask's Open, while the user is on the page.
+- **Closed:** `cancel` when the model stopped waiting, shown as "This has expired, please try again later"; `expired`
+  past `expiresAt`. Either takes no response (`action_closed`).
 
 ## Files
 
@@ -292,6 +334,8 @@ Show your own words for the code:
 | `conversation_list_off` | (nothing: offer the list, opening and deleting only while `conversationList` is `true`) |
 | `not_found` | This conversation is gone. (From `readFile`: That file is gone.) |
 | `busy` | Still answering your previous message. (From `deleteConversation`: It's still answering there. Try again when it's done.) |
+| `action_closed` | This has closed. (Decided, cancelled or expired: show its status.) |
+| `workspace_unavailable` | We couldn't pass on your response. Try again in a moment. |
 | `too_large` | That message is too long. (From `attach`: That file is too large.) |
 | `rate_limited` | You're sending messages too fast. Try again in a moment. (Also when the workspace is past its plan's limit on requests.) |
 | `overloaded` | The chat is busy. Try again in a moment. (The chat's machine is short of memory.) |
