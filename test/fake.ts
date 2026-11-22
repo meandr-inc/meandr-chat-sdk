@@ -8,7 +8,17 @@ interface Message {
   tools?: string[];
   tool_titles?: Record<string, string>;
   files?: FileJSON[];
+  questions?: QuestionJSON[];
   created_at: string;
+}
+
+export interface QuestionJSON {
+  id: string;
+  kind: string;
+  tool: string;
+  title: string;
+  status: string;
+  [key: string]: unknown;
 }
 
 export interface FileJSON {
@@ -53,6 +63,7 @@ export interface Turn {
   stall?: boolean;
   pollsAnswering?: number;
   extra?: string;
+  questions?: QuestionJSON[]; // its tools' questions, each after its tool's waiting, before done
 }
 
 export interface Refusal {
@@ -144,6 +155,7 @@ export class FakeChat {
   contextMax: number | null = 8 << 10; // CHAT_PAGE_CONTEXT_KIB; null plays a chat from before page context
   conversationList: boolean | null = false; // CHAT_CONVERSATION_LIST; null plays a chat from before the list
   files = new Map<string, Stored>();
+  answers: Array<{ question: string; body: unknown }> = [];
   private n = 0;
   private msgId = 0;
 
@@ -183,6 +195,11 @@ export class FakeChat {
     if (method === "POST" && path === "/chat/v1/start") {
       const who = this.identify(bearer);
       return "status" in who ? who : this.startTurn(who, (body || {}) as { new?: boolean; context?: unknown }, init.signal);
+    }
+    const q = /^\/chat\/v1\/conversations\/([^/?]+)\/questions\/([^/?]+)$/.exec(path);
+    if (q && method === "POST") {
+      const who = this.identify(bearer);
+      return "status" in who ? who : this.answer(who, decodeURIComponent(q[1]), decodeURIComponent(q[2]), body, init.signal);
     }
     const m = /^\/chat\/v1\/conversations(?:\/([^/?]+)(\/messages|\/end)?)?(?:\?(.*))?$/.exec(path);
     if (m) {
@@ -471,9 +488,34 @@ export class FakeChat {
     const stored = this.msg("assistant", answer);
     if (turn.tools) stored.tools = turn.tools.filter((t) => t.status === "started").map((t) => t.name);
     for (const t of turn.tools || []) if (t.title) stored.tool_titles = { ...stored.tool_titles, [t.name]: t.title };
+    for (const qu of turn.questions || []) parts.push(ev("tool", { name: qu.tool, status: "waiting", title: qu.title }), ev("question", qu));
+    if (turn.questions) stored.questions = turn.questions.map((qu) => ({ ...qu }));
     c.messages.push(stored);
     parts.push(": keep-alive\n\n");
     parts.push(ev("done", { message: stored, stop: turn.stop || "end" }));
+    return stream(parts, "close", signal);
+  }
+
+  // answer takes the user's answer to a question in their conversation, as server.go's
+  // answerQuestion: then the conversation goes on, streamed, with no message event.
+  private answer(who: Identity, id: string, qid: string, body: unknown, signal?: AbortSignal | null): Response {
+    const c = this.owned(who, id);
+    if ("status" in c) return c;
+    const asked = c.messages.flatMap((m) => m.questions || []).find((qu) => qu.id === qid);
+    if (!asked) return json(404, { error: "not_found", message: "No such question." });
+    if (asked.status !== "pending") return json(409, { error: "question_closed", message: "This question was " + asked.status + "." });
+    const running = Array.from(this.convs.values()).some((x) => x.sub === who.sub && (x.answering > 0 || x.pending !== null));
+    if (running || Date.now() < this.busyUntil) return json(409, { error: "busy", message: "Still answering your previous message." });
+    const action = (body as { action?: string } | undefined)?.action;
+    asked.status = action === "accept" ? "answered" : action === "decline" ? "declined" : "cancelled";
+    this.answers.push({ question: qid, body });
+    this.msgId++; // the hidden turn telling the model
+    const turn = this.turns.shift() || {};
+    const deltas = turn.deltas || ["Thanks"];
+    const stored = this.msg("assistant", turn.text !== undefined ? turn.text : deltas.join(""));
+    c.messages.push(stored);
+    const parts = deltas.map((d) => ev("delta", { text: d }));
+    parts.push(ev("done", { message: stored, stop: "end" }));
     return stream(parts, "close", signal);
   }
 

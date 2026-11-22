@@ -16,7 +16,36 @@ export interface Message {
   tools?: string[];
   toolTitles?: Record<string, string>; // with tools: each one's title by name, its name where the chat knows none
   files?: ChatFile[];
+  questions?: Question[]; // an answer's: what its tools asked the user
   createdAt: string;
+}
+
+export type QuestionStatus = "pending" | "answered" | "declined" | "cancelled" | "expired" | (string & {});
+
+// A tool's question for the user: a form (fields, {} for a confirmation) or pages to open (links).
+export interface Question {
+  id: string;
+  kind: "form" | "url" | (string & {});
+  server: string; // the asking server's name
+  tool: string;
+  title: string; // the tool's title, or its name
+  message: string; // a form's text, saying why it asks; plain text
+  fields: Record<string, unknown> | null; // a form's requestedSchema
+  links: QuestionLink[]; // a URL ask's pages
+  done: boolean; // a URL ask whose answer is the user's Done, once finished there, not the Open
+  status: QuestionStatus;
+  expiresAt: string | null;
+}
+
+export interface QuestionLink {
+  url: string;
+  message: string;
+}
+
+// The user's answer: content goes only with a form's accept, holding its fields.
+export interface QuestionAnswer {
+  action: "accept" | "decline" | "cancel";
+  content?: Record<string, unknown>;
 }
 
 // A file the visitor attached; type is its media type, size in bytes.
@@ -37,7 +66,7 @@ export interface FileLimits {
 
 // Open string unions: v1 may add values, which the client passes through.
 export type Stop = "end" | "max_tokens" | "refusal" | "paused" | (string & {});
-export type ToolStatus = "started" | "done" | "failed" | (string & {});
+export type ToolStatus = "started" | "done" | "failed" | "waiting" | (string & {});
 
 export interface ToolProgress {
   name: string;
@@ -48,6 +77,7 @@ export interface ToolProgress {
 export interface Answer {
   text: string;
   tools: readonly ToolProgress[];
+  questions?: readonly Question[]; // asked as the answer ends; done's message carries them too
 }
 
 export type ChatStatus = "idle" | "opening" | "ready" | "error";
@@ -157,6 +187,13 @@ export interface Chat {
   deleteConversation(conversation: Conversation | string): Promise<DeleteConversationResult>;
   /** Adds the 20 messages before the oldest shown, while hasOlder; calls while one runs share it. */
   loadOlder(): Promise<LoadOlderResult>;
+  /** Answers a tool's question in the conversation shown; it goes on, streamed as a message's answer is. */
+  answerQuestion(question: Question | string, answer: QuestionAnswer): Promise<SendResult>;
+  /**
+   * Opens one of a URL ask's pages in a new tab, never a frame; call it from the user's click. Without done,
+   * opening is the answer: it sends the accept and returns its result; with done, null (Done answers).
+   */
+  openQuestionLink(question: Question, url: string): Promise<SendResult> | null;
   reopen(options?: ReopenOptions): Promise<ChatState>;
   signOut(): Promise<void>;
   destroy(): void;
