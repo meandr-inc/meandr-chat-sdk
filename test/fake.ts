@@ -9,6 +9,7 @@ interface Message {
   tool_titles?: Record<string, string>;
   files?: FileJSON[];
   actions?: ActionJSON[];
+  stop?: string;
   created_at: string;
 }
 
@@ -521,7 +522,7 @@ export class FakeChat {
       c.halt = () => {
         c.halt = undefined;
         c.pending = null;
-        const kept = answer ? this.msg("assistant", answer) : null;
+        const kept = answer ? { ...this.msg("assistant", answer), stop: "stopped" } : null;
         if (kept) c.messages.push(kept);
         resolve([ev("done", { message: kept, stop: "stopped" })]);
       };

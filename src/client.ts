@@ -1068,7 +1068,7 @@ class Client implements Chat {
   // named notes the conversation the send's stream answers in, and asks the chat to stop
   // its answer when the user already did.
   private named_(id: string): void {
-    if (this.sending_ === null) return;
+    if (!this.sending_) return;
     this.streaming_ = id;
     if (this.stopping_() && this.stopAsked_ !== this.sending_) void this.askStop_(id);
   }
@@ -1617,6 +1617,7 @@ function messageOf(v: unknown): Message {
   }
   if (Array.isArray(o.files)) m.files = o.files.filter((f) => f && typeof f.id === "string").map(fileOf);
   if (Array.isArray(o.actions)) m.actions = actionsOf(o.actions);
+  if (o.stop) m.stop = String(o.stop);
   return m;
 }
 

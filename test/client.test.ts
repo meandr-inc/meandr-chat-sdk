@@ -2937,10 +2937,13 @@ describe("stopping", () => {
     await vi.waitFor(() => expect(chat.getState().answer?.text).toBe("Half "));
     expect(await chat.stop()).toEqual({ ok: true });
     const r = ok(await p);
-    expect([r.message.text, r.stop]).toEqual(["Half ", "stopped"]);
+    expect([r.message.text, r.stop, r.message.stop]).toEqual(["Half ", "stopped", "stopped"]);
     expect(chat.getState()).toMatchObject({ answering: false, answer: null, stop: "stopped", error: null });
     expect(chat.getState().messages.map((m) => m.text)).toEqual(["q", "Half "]);
     expect(fake.stops).toEqual([chat.getState().conversation!.id]);
+    // Opened again, as after a reload, the answer still says it was stopped.
+    const again = setup({ token: ALICE }, fake).chat;
+    expect((await again.open()).messages.map((m) => m.stop)).toEqual([undefined, "stopped"]);
   });
 
   it("says stopped, showing no error, when the assistant hadn't written anything", async () => {

@@ -17,6 +17,7 @@ export interface Message {
   toolTitles?: Record<string, string>; // with tools: each one's title by name, its name where the chat knows none
   files?: ChatFile[];
   actions?: Action[]; // an answer's: what its tool calls waited on for the user
+  stop?: Stop; // an answer's: why it ended, as when it streamed; absent for a failed one, or one from an older chat
   createdAt: string;
 }
 
