@@ -975,8 +975,8 @@ class Client implements Chat {
   // send set answering in; once the page shows another, answering is not its own.
   private failed_(mine: object, scope: AbortController, err: ChatError, began: number): SendResult {
     if (this.sending_ === mine && !scope.signal.aborted && err.code !== "aborted") {
-      // A stop is the user's own doing, never an error to show.
-      const shown: Partial<ChatState> = err.code === "stopped" ? { error: null, stop: "stopped" } : { error: err };
+      // A stop is the user's own doing, never an error to show; one never sent was canceled.
+      const shown: Partial<ChatState> = err.code === "stopped" ? { error: null, stop: this.state_.stop || "canceled" } : { error: err };
       if (began < 0) this.set_(shown);
       else if (began === this.convVersion_) this.set_({ answer: null, answering: false, waiting: null, ...shown });
       else this.set_({ answer: null, waiting: null, ...shown });
@@ -1236,6 +1236,7 @@ class Client implements Chat {
     } catch {
       throw new ChatError("protocol", "The stream couldn't be read.");
     }
+    const stop = typeof o.stop === "string" ? (o.stop as Stop) : null; // done's and error's
     switch (name) {
       case "conversation": {
         const c = conversationOf(o);
@@ -1276,8 +1277,8 @@ class Client implements Chat {
         return null;
       }
       case "done": {
-        const stop = typeof o.stop === "string" ? (o.stop as Stop) : null;
-        if (o.message == null && stop === "stopped") {
+        // A stop with nothing written has no message to keep.
+        if (o.message == null && stop) {
           this.set_({ outgoing: null, answer: null, answering: false, waiting: null, stop });
           throw halted();
         }
@@ -1289,7 +1290,7 @@ class Client implements Chat {
       default: {
         const partial = o.partial ? messageOf(o.partial) : null;
         if (partial) this.seen_([partial]);
-        this.set_({ messages: partial ? withMessage(this.state_.messages, partial) : this.state_.messages, outgoing: null, answer: null, answering: false });
+        this.set_({ messages: partial ? withMessage(this.state_.messages, partial) : this.state_.messages, outgoing: null, answer: null, answering: false, stop });
         const code = typeof o.error === "string" && o.error !== "" ? o.error : "unavailable";
         throw new ChatError(code, typeof o.message === "string" ? o.message : "The answer failed.", { status: 200, partial });
       }

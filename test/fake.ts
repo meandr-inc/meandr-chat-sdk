@@ -495,7 +495,7 @@ export class FakeChat {
     if (turn.drop === "after-deltas") return stream(parts, "drop", signal, () => this.runOn(c, answer, turn));
     if (turn.stall) return stream(parts, "stall", signal, () => this.runOn(c, answer, turn));
     if (turn.error) {
-      const data: Record<string, unknown> = { error: turn.error.error, message: turn.error.message || "failed" };
+      const data: Record<string, unknown> = { error: turn.error.error, message: turn.error.message || "failed", stop: turn.stop || "failed" };
       if (turn.error.partial) {
         const partial = this.msg("assistant", answer);
         c.messages.push(partial);
@@ -510,7 +510,7 @@ export class FakeChat {
     if (kept.size) stored.actions = Array.from(kept.values()).map((a) => ({ ...a }));
     c.messages.push(stored);
     parts.push(": keep-alive\n\n");
-    parts.push(ev("done", { message: stored, stop: turn.stop || "end" }));
+    parts.push(ev("done", { message: stored, stop: turn.stop || "completed" }));
     return stream(parts, "close", signal);
   }
 
@@ -522,9 +522,9 @@ export class FakeChat {
       c.halt = () => {
         c.halt = undefined;
         c.pending = null;
-        const kept = answer ? { ...this.msg("assistant", answer), stop: "stopped" } : null;
+        const kept = answer ? { ...this.msg("assistant", answer), stop: "aborted" } : null;
         if (kept) c.messages.push(kept);
-        resolve([ev("done", { message: kept, stop: "stopped" })]);
+        resolve([ev("done", { message: kept, stop: "aborted" })]);
       };
     });
     return held(parts, stopped);
@@ -574,7 +574,7 @@ export class FakeChat {
     if (turn.drop === "after-deltas") return stream(parts, "drop", signal, () => this.runOn(c, answer, turn));
     const stored = this.msg("assistant", answer);
     c.messages.push(stored);
-    parts.push(ev("done", { message: stored, stop: turn.stop || "end" }));
+    parts.push(ev("done", { message: stored, stop: turn.stop || "completed" }));
     return stream(parts, "close", signal);
   }
 

@@ -67,7 +67,20 @@ export interface FileLimits {
 }
 
 // Open string unions: v1 may add values, which the client passes through.
-export type Stop = "end" | "max_tokens" | "refusal" | "paused" | "stopped" | (string & {});
+// Why an answer ended: the model's (completed to paused), the user's stop (aborted while written, canceled while
+// queued), or a failure's (throttled: the model provider rate-limited or overloaded).
+export type Stop =
+  | "completed"
+  | "max_tokens"
+  | "refusal"
+  | "paused"
+  | "aborted"
+  | "canceled"
+  | "throttled"
+  | "timeout"
+  | "interrupted"
+  | "failed"
+  | (string & {});
 export type ToolStatus = "started" | "done" | "failed" | "waiting" | (string & {});
 
 export interface ToolProgress {
@@ -183,7 +196,7 @@ export interface Chat {
   start(): Promise<SendResult>;
   /**
    * Stops the answer being written in the conversation shown, which keeps what it wrote: its send or start
-   * resolves with stop "stopped", or with the error stopped when there is no answer to keep.
+   * resolves with stop "aborted", or with the error stopped when there is no answer to keep.
    */
   stop(): Promise<StopResult>;
   /** Ends the conversation shown and forgets it at once; before the session opens, the one it opens on. Never rejects. */
