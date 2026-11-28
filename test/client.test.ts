@@ -387,7 +387,7 @@ describe("messages", () => {
 
   it("surfaces the answer's error with what was stored, and says the model was busy", async () => {
     const fake = new FakeChat();
-    fake.turns.push({ deltas: ["Part"], error: { error: "timeout", partial: true } }, { error: { error: "model_busy" } });
+    fake.turns.push({ deltas: ["Part"], error: { error: "timeout", partial: true }, stop: "timeout" }, { error: { error: "model_busy" }, stop: "throttled" });
     const { chat } = setup({ token: ALICE }, fake);
     const e = err(await chat.send("q"));
     expect(e).toBeInstanceOf(ChatError);
@@ -395,6 +395,7 @@ describe("messages", () => {
     expect(e.retryable).toBe(true);
     expect(e.partial?.text).toBe("Part");
     expect(chat.getState().error?.code).toBe("timeout");
+    expect(chat.getState().stop).toBe("timeout");
     expect(chat.getState().messages.map((m) => m.text)).toEqual(["q", "Part"]);
     expect(chat.getState().answering).toBe(false);
     expect(chat.getState().outgoing).toBeNull();
@@ -2937,13 +2938,13 @@ describe("stopping", () => {
     await vi.waitFor(() => expect(chat.getState().answer?.text).toBe("Half "));
     expect(await chat.stop()).toEqual({ ok: true });
     const r = ok(await p);
-    expect([r.message.text, r.stop, r.message.stop]).toEqual(["Half ", "stopped", "stopped"]);
-    expect(chat.getState()).toMatchObject({ answering: false, answer: null, stop: "stopped", error: null });
+    expect([r.message.text, r.stop, r.message.stop]).toEqual(["Half ", "aborted", "aborted"]);
+    expect(chat.getState()).toMatchObject({ answering: false, answer: null, stop: "aborted", error: null });
     expect(chat.getState().messages.map((m) => m.text)).toEqual(["q", "Half "]);
     expect(fake.stops).toEqual([chat.getState().conversation!.id]);
     // Opened again, as after a reload, the answer still says it was stopped.
     const again = setup({ token: ALICE }, fake).chat;
-    expect((await again.open()).messages.map((m) => m.stop)).toEqual([undefined, "stopped"]);
+    expect((await again.open()).messages.map((m) => m.stop)).toEqual([undefined, "aborted"]);
   });
 
   it("says stopped, showing no error, when the assistant hadn't written anything", async () => {
@@ -2954,7 +2955,7 @@ describe("stopping", () => {
     await vi.waitFor(() => expect(chat.getState().messages).toHaveLength(1));
     await chat.stop();
     expect(err(await p).code).toBe("stopped");
-    expect(chat.getState()).toMatchObject({ answering: false, answer: null, outgoing: null, stop: "stopped", error: null });
+    expect(chat.getState()).toMatchObject({ answering: false, answer: null, outgoing: null, stop: "aborted", error: null });
     expect(chat.getState().messages.map((m) => m.text)).toEqual(["q"]);
   });
 
@@ -2973,7 +2974,7 @@ describe("stopping", () => {
     expect(chat.getState().waiting?.code).toBe("rate_limited");
     await chat.stop();
     expect(err(await second).code).toBe("stopped");
-    expect(chat.getState()).toMatchObject({ outgoing: "q", waiting: null, answering: false, stop: "stopped", error: null });
+    expect(chat.getState()).toMatchObject({ outgoing: "q", waiting: null, answering: false, stop: "canceled", error: null });
     expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(1);
     expect(fake.stops).toEqual([]);
   });
@@ -2994,7 +2995,7 @@ describe("stopping", () => {
     expect(await chat.stop()).toEqual({ ok: true });
     expect(fake.stops).toEqual([]);
     go();
-    expect(ok(await p).stop).toBe("stopped");
+    expect(ok(await p).stop).toBe("aborted");
     expect(fake.stops).toEqual([chat.getState().conversation!.id]);
   });
 
