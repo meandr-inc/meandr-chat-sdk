@@ -99,6 +99,7 @@ can't silently resume someone's session.
 | `attach(file, { name, onProgress, signal })` | uploads a `File` or `Blob` for a message of the visitor's within the hour, opening the session if need be: see [Files](#files). `name` is the file's own unless given, else `"file"`; `onProgress(sent, total)` follows its bytes; `signal` cancels it. Resolves with `{ ok: true, file }`, a ChatFile, or `{ ok: false, error }`, and changes nothing in the state |
 | `readFile(file, { signal })` | fetches a file the visitor attached, by its ChatFile or id, with the session's credentials, opening the session if need be. Resolves with `{ ok: true, blob }` or `{ ok: false, error }` |
 | `start()` | has the assistant speak first, as the chat's start instructions say, and streams the answer: in the user's latest conversation they haven't ended, usually the one shown, or a new one when none is shown. Resolves as `send` does |
+| `stop()` | stops the answer being written in the conversation shown, in this page or one it follows; the chat keeps what it wrote. The `send` or `start` resolves with that answer and `stop: "stopped"`, or with `{ ok: false, error }` coded `stopped` when there is none to keep: stopped before the assistant wrote anything, or before the chat took the message, which then stays in `outgoing`. Resolves with `{ ok: true }` or `{ ok: false, error }` |
 | `endConversation()` | ends the conversation shown and forgets it at once, so no page shows it again by itself: see [Conversations](#conversations). Resolves once the chat has it, or after about a minute of trying; never rejects |
 | `newConversation()` | ends the conversation shown, as `endConversation()` does: the next message, or `start()`, starts a new one |
 | `listConversations({ before, signal })` | lists the user's conversations, 20 at a time, most recently active first, opening the session if need be: see [Conversations](#conversations). `before`, a Conversation or its id, goes on after that one; `signal` cancels it. Resolves with `{ ok: true, conversations, hasMore }`, each with its `title`, or `{ ok: false, error }`, and changes nothing in the state |
@@ -123,18 +124,19 @@ those yourself rather than handing them an event.
 | `status` | `"idle"` before opening, `"opening"`, `"ready"`, or `"error"` when opening failed (`error` says why) |
 | `anonymous` | whether the session is an anonymous visitor's; `null` before opening |
 | `conversation` | `{ id, createdAt, updatedAt, endedAt }`, or `null` before the first message. `endedAt` is when the user ended it, `null` while they haven't; their next message there reopens it |
-| `messages` | the conversation's stored messages, oldest first: its last 20 when it's shown, and older ones as `loadOlder()` adds them. Each is `{ id, role, text, tools?, toolTitles?, files?, actions?, createdAt }`. `tools` names the tools the answer used, and `toolTitles`, with it, gives each one's title by name, its name where the chat knows none; `files` are the ChatFiles the visitor attached; `actions`, on an answer, what its tool calls waited on (see [Actions](#actions)) |
+| `messages` | the conversation's stored messages, oldest first: its last 20 when it's shown, and older ones as `loadOlder()` adds them. Each is `{ id, role, text, tools?, toolTitles?, files?, actions?, stop?, createdAt }`. `tools` names the tools the answer used, and `toolTitles`, with it, gives each one's title by name, its name where the chat knows none; `files` are the ChatFiles the visitor attached; `actions`, on an answer, what its tool calls waited on (see [Actions](#actions)); `stop`, on an answer, why it ended, as `stop` below, so one the user stopped still shows as stopped after a reload (absent for a failed one, or one from an older chat) |
 | `hasOlder` | the conversation shown has messages older than those in `messages`: `loadOlder()` adds them |
 | `outgoing` | the text of the message being sent, `""` with files alone, until the page shows it stored. With `error` set, it may not have reached the chat: offer to send it again, with its files, which never stores it twice |
 | `answer` | the answer being written in this page: `{ text, tools: [{ name, status, title }], actions? }`, or `null`. Show a tool's `title`: its name when the chat knows none. A tool `"waiting"` waits on the user's response to an action, which `actions` carries |
 | `answering` | an answer is being written in this conversation: in this page, or one the page lost or a previous page left running |
 | `waiting` | `{ code, until }` while the client waits by itself, such as `rate_limited`, or `null`. `until` is a time in milliseconds, as from `Date.now()` |
-| `stop` | why the last answer ended: `"end"`, `"max_tokens"` (cut short), `"refusal"` or `"paused"`; `null` when unknown |
+| `stop` | why the last answer ended: `"end"`, `"max_tokens"` (cut short), `"refusal"`, `"paused"` or `"stopped"` (by `stop()`); `null` when unknown |
 | `error` | the last failure, until the next action |
 | `files` | what the chat takes, as its session says: `{ types, maxBytes, perMessage }`, the media types, a file's most bytes and a message's most files. `null` before opening and while it takes no file: offer attaching only when it isn't `null` |
 | `conversationList` | whether the chat lists the user's conversations, as its session says: offer the list, and opening and deleting conversations from it, only while it's `true`. `null` before opening |
 
-Show `messages`, then `outgoing`, then `answer`. Disable sending while `answering` or `status` is `"opening"`. An
+Show `messages`, then `outgoing`, then `answer`. Disable sending while `answering` or `status` is `"opening"`, and
+offer Stop while `answering`. An
 assistant's `text` is Markdown from a model: render it with `@meandr/chat-sdk/markdown`, or another renderer that
 never passes raw HTML through. A user's text is plain text.
 
@@ -344,6 +346,7 @@ Show your own words for the code:
 | `interrupted`, `timeout`, `unavailable`, `no_answer` | The answer failed. Try again. |
 | `network` | We couldn't reach the chat. |
 | `aborted` | (nothing: your page cut the message short) |
+| `stopped` | (nothing: the user stopped it; with `outgoing` set, the message wasn't sent) |
 | `bad_request`, `internal`, `protocol` | Something went wrong. Try again. |
 
 Codes the client doesn't know may come: show a general error for those.

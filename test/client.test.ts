@@ -2927,3 +2927,89 @@ describe("actions", () => {
     expect(open).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("stopping", () => {
+  it("stops the answer under way, which keeps what it wrote", async () => {
+    const fake = new FakeChat();
+    fake.turns.push({ deltas: ["Half "], untilStopped: true });
+    const { chat } = setup({ token: ALICE }, fake);
+    const p = chat.send("q");
+    await vi.waitFor(() => expect(chat.getState().answer?.text).toBe("Half "));
+    expect(await chat.stop()).toEqual({ ok: true });
+    const r = ok(await p);
+    expect([r.message.text, r.stop, r.message.stop]).toEqual(["Half ", "stopped", "stopped"]);
+    expect(chat.getState()).toMatchObject({ answering: false, answer: null, stop: "stopped", error: null });
+    expect(chat.getState().messages.map((m) => m.text)).toEqual(["q", "Half "]);
+    expect(fake.stops).toEqual([chat.getState().conversation!.id]);
+    // Opened again, as after a reload, the answer still says it was stopped.
+    const again = setup({ token: ALICE }, fake).chat;
+    expect((await again.open()).messages.map((m) => m.stop)).toEqual([undefined, "stopped"]);
+  });
+
+  it("says stopped, showing no error, when the assistant hadn't written anything", async () => {
+    const fake = new FakeChat();
+    fake.turns.push({ deltas: [], untilStopped: true });
+    const { chat } = setup({ token: ALICE }, fake);
+    const p = chat.send("q");
+    await vi.waitFor(() => expect(chat.getState().messages).toHaveLength(1));
+    await chat.stop();
+    expect(err(await p).code).toBe("stopped");
+    expect(chat.getState()).toMatchObject({ answering: false, answer: null, outgoing: null, stop: "stopped", error: null });
+    expect(chat.getState().messages.map((m) => m.text)).toEqual(["q"]);
+  });
+
+  it("sends nothing when stopped before the message goes, or while it waits to try again, keeping the draft", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    const first = chat.send("q");
+    await chat.stop();
+    expect(err(await first).code).toBe("stopped");
+    expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(0);
+
+    fake.refusals.push({ method: "POST", path: /\/conversations$/, status: 429, error: "rate_limited", retryAfter: 30, times: 1 });
+    const second = chat.send("q");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(chat.getState().waiting?.code).toBe("rate_limited");
+    await chat.stop();
+    expect(err(await second).code).toBe("stopped");
+    expect(chat.getState()).toMatchObject({ outgoing: "q", waiting: null, answering: false, stop: "stopped", error: null });
+    expect(fake.requests("POST", "/chat/v1/conversations")).toHaveLength(1);
+    expect(fake.stops).toEqual([]);
+  });
+
+  it("asks the chat to stop once the stream names a conversation the message was on its way to start", async () => {
+    const fake = new FakeChat();
+    fake.turns.push({ deltas: ["Half "], untilStopped: true });
+    let go!: () => void;
+    const held = new Promise<void>((resolve) => (go = resolve));
+    const slow: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("/conversations") && init?.method === "POST") await held;
+      return fake.fetch(input, init);
+    };
+    const { chat } = setup({ token: ALICE, fetch: slow }, fake);
+    await chat.open();
+    const p = chat.send("q");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(await chat.stop()).toEqual({ ok: true });
+    expect(fake.stops).toEqual([]);
+    go();
+    expect(ok(await p).stop).toBe("stopped");
+    expect(fake.stops).toEqual([chat.getState().conversation!.id]);
+  });
+
+  it("stops an answer it follows but didn't start, and asks nothing when none is being written", async () => {
+    const fake = new FakeChat();
+    const { chat } = setup({ token: ALICE }, fake);
+    await chat.open();
+    expect(await chat.stop()).toEqual({ ok: true });
+    expect(fake.requests("POST").filter((s) => s.path.endsWith("/stop"))).toHaveLength(0);
+
+    const c = fake.conversation("alice", "", ["q1"]);
+    c.pending = "a1";
+    const other = setup({ token: ALICE }, fake).chat;
+    expect((await other.open()).answering).toBe(true);
+    expect(await other.stop()).toEqual({ ok: true });
+    expect(fake.stops).toEqual([c.id]);
+  });
+});

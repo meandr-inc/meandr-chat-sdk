@@ -9,6 +9,7 @@ interface Message {
   tool_titles?: Record<string, string>;
   files?: FileJSON[];
   actions?: ActionJSON[];
+  stop?: string;
   created_at: string;
 }
 
@@ -65,6 +66,7 @@ export interface Turn {
   extra?: string;
   actions?: ActionJSON[]; // what its tool calls wait on, as they come: an id again is a status change
   toolsAfter?: Array<{ name: string; status: string; title?: string }>; // tool events after the actions, such as a waiting tool's done
+  untilStopped?: boolean; // after its deltas, writes on until stopped, keeping them, if any, as a stopped answer
 }
 
 export interface Refusal {
@@ -103,6 +105,7 @@ interface Conv {
   pending: string | null;
   ended: string | null;
   waitingOn?: ActionJSON[]; // what the answer being written waits on, while answering
+  halt?: () => void; // stops the answer being written
 }
 
 interface Identity {
@@ -158,6 +161,7 @@ export class FakeChat {
   conversationList: boolean | null = false; // CHAT_CONVERSATION_LIST; null plays a chat from before the list
   files = new Map<string, Stored>();
   responses: Array<{ action: string; body: unknown }> = [];
+  stops: string[] = []; // the conversations a stop was asked for
   private n = 0;
   private msgId = 0;
 
@@ -203,7 +207,7 @@ export class FakeChat {
       const who = this.identify(bearer);
       return "status" in who ? who : this.respond(who, decodeURIComponent(q[1]), decodeURIComponent(q[2]), body);
     }
-    const m = /^\/chat\/v1\/conversations(?:\/([^/?]+)(\/messages|\/end)?)?(?:\?(.*))?$/.exec(path);
+    const m = /^\/chat\/v1\/conversations(?:\/([^/?]+)(\/messages|\/end|\/stop)?)?(?:\?(.*))?$/.exec(path);
     if (m) {
       const who = this.identify(bearer);
       if ("status" in who) return who;
@@ -211,6 +215,7 @@ export class FakeChat {
       const before = new URLSearchParams(m[3] || "").get("before");
       if (method === "GET" && !m[2]) return id ? this.view(who, id, before) : this.list(who, before);
       if (method === "POST" && id && m[2] === "/end") return this.end(who, id);
+      if (method === "POST" && id && m[2] === "/stop") return this.stopAnswer(who, id);
       if (method === "POST" && (!id || m[2] === "/messages")) return this.message(who, id, body, init.signal);
       if (method === "DELETE" && id && !m[2]) return this.remove(who, id);
     }
@@ -486,6 +491,7 @@ export class FakeChat {
     }
     for (const t of turn.toolsAfter || []) parts.push(ev("tool", t));
     for (const d of deltas) parts.push(ev("delta", { text: d }));
+    if (turn.untilStopped) return this.untilStopped(c, parts, answer);
     if (turn.drop === "after-deltas") return stream(parts, "drop", signal, () => this.runOn(c, answer, turn));
     if (turn.stall) return stream(parts, "stall", signal, () => this.runOn(c, answer, turn));
     if (turn.error) {
@@ -506,6 +512,31 @@ export class FakeChat {
     parts.push(": keep-alive\n\n");
     parts.push(ev("done", { message: stored, stop: turn.stop || "end" }));
     return stream(parts, "close", signal);
+  }
+
+  // untilStopped streams parts, then writes on until the answer is stopped, as server.go's
+  // stopAnswer: done with what it wrote, or no message for nothing written.
+  private untilStopped(c: Conv, parts: string[], answer: string): Response {
+    c.pending = answer;
+    const stopped = new Promise<string[]>((resolve) => {
+      c.halt = () => {
+        c.halt = undefined;
+        c.pending = null;
+        const kept = answer ? { ...this.msg("assistant", answer), stop: "stopped" } : null;
+        if (kept) c.messages.push(kept);
+        resolve([ev("done", { message: kept, stop: "stopped" })]);
+      };
+    });
+    return held(parts, stopped);
+  }
+
+  // stopAnswer stops the answer being written in the user's conversation: 204, whether or not one is.
+  private stopAnswer(who: Identity, id: string): Response {
+    const c = this.owned(who, id);
+    if ("status" in c) return c;
+    this.stops.push(id);
+    if (c.halt) c.halt();
+    return new Response(null, { status: 204 });
   }
 
   // respond takes the user's response to an action in their conversation, as server.go's
@@ -705,6 +736,25 @@ export function json(status: number, body: unknown, retryAfter?: number): Respon
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (retryAfter !== undefined) headers["Retry-After"] = String(retryAfter);
   return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
+}
+
+// held answers an event stream of parts, then of what more brings, then closes.
+function held(parts: string[], more: Promise<string[]>): Response {
+  const enc = new TextEncoder();
+  const queue = parts.slice();
+  let waited = false;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!queue.length && !waited) {
+        waited = true;
+        queue.push(...(await more));
+      }
+      const next = queue.shift();
+      if (next === undefined) controller.close();
+      else controller.enqueue(enc.encode(next));
+    },
+  });
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
 }
 
 // stream answers an event stream that closes, breaks, or goes silent until aborted.

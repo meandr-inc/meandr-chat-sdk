@@ -28,6 +28,7 @@ import type {
   SendOptions,
   SendResult,
   Stop,
+  StopResult,
 } from "./types.js";
 
 // Auth is what a request carries: the browser's cookie, or, in a browser that
@@ -143,6 +144,10 @@ class Client implements Chat {
   private moves_ = 0; // openConversation, send and start calls: an open outrun by one shows nothing
   private unnamed_: Unnamed | null = null; // the send or start out to start a conversation, until the chat names it
   private sending_: object | null = null;
+  private stopped_: object | null = null; // the send the user stopped
+  private stopAsked_: object | null = null; // the send whose answer the chat was asked to stop
+  private streaming_: string | null = null; // the conversation the send's stream answers in, once named
+  private wake_: (() => void) | null = null; // ends the send's wait to try again
   private watcher_: AbortController | null = null;
   private older_: { from_: Message; p_: Promise<LoadOlderResult> } | null = null; // loadOlder's request, for those before from_
   private unsure_: Sent | null = null; // a message the chat may have stored: sending it again checks first
@@ -231,6 +236,20 @@ class Client implements Chat {
   };
 
   start = (): Promise<SendResult> => this.doStart_();
+
+  stop = (): Promise<StopResult> => {
+    if (this.dead_) return Promise.resolve({ ok: true });
+    const mine = this.sending_;
+    if (mine) {
+      this.stopped_ = mine;
+      if (this.wake_) this.wake_();
+      // Not sent yet, it never is; sent, the chat is asked once its stream names the conversation.
+      const id = this.streaming_;
+      return id !== null && this.stopAsked_ !== mine ? this.askStop_(id) : Promise.resolve({ ok: true });
+    }
+    const c = this.state_.conversation;
+    return c && this.state_.answering ? this.askStop_(c.id) : Promise.resolve({ ok: true });
+  };
 
   endConversation = (): Promise<void> => {
     if (this.dead_) return Promise.resolve();
@@ -841,6 +860,7 @@ class Client implements Chat {
     if (this.sending_ || this.state_.answering) return { ok: false, error: busy() };
     const mine = {};
     this.sending_ = mine;
+    this.streaming_ = null;
     this.moves_++;
     const scope = this.conv_;
     const u = this.unsure_;
@@ -874,6 +894,7 @@ class Client implements Chat {
     if (this.sending_ || this.state_.answering) return { ok: false, error: busy() };
     const mine = {};
     this.sending_ = mine;
+    this.streaming_ = null;
     this.moves_++;
     const scope = this.conv_;
     let began = -1;
@@ -907,6 +928,7 @@ class Client implements Chat {
     const waitUntil = Date.now() + WAIT_CAP_MS;
     const busyUntil = Date.now() + BUSY_CAP_MS;
     for (let busyTries = 0; ; ) {
+      if (this.stopping_()) throw halted();
       const stream = new AbortController();
       const u: Unnamed | null = fresh ? { session_: this.session_.signal } : null;
       const stop = () => {
@@ -953,9 +975,11 @@ class Client implements Chat {
   // send set answering in; once the page shows another, answering is not its own.
   private failed_(mine: object, scope: AbortController, err: ChatError, began: number): SendResult {
     if (this.sending_ === mine && !scope.signal.aborted && err.code !== "aborted") {
-      if (began < 0) this.set_({ error: err });
-      else if (began === this.convVersion_) this.set_({ answer: null, answering: false, waiting: null, error: err });
-      else this.set_({ answer: null, waiting: null, error: err });
+      // A stop is the user's own doing, never an error to show.
+      const shown: Partial<ChatState> = err.code === "stopped" ? { error: null, stop: "stopped" } : { error: err };
+      if (began < 0) this.set_(shown);
+      else if (began === this.convVersion_) this.set_({ answer: null, answering: false, waiting: null, ...shown });
+      else this.set_({ answer: null, waiting: null, ...shown });
     }
     return { ok: false, error: err };
   }
@@ -972,6 +996,7 @@ class Client implements Chat {
     const waitUntil = Date.now() + WAIT_CAP_MS;
     const busyUntil = Date.now() + BUSY_CAP_MS;
     for (let busyTries = 0; ; ) {
+      if (this.stopping_()) throw halted();
       const stream = new AbortController();
       const u: Unnamed | null = sent.target_ === null ? { session_: this.session_.signal } : null;
       const stop = () => {
@@ -1017,14 +1042,45 @@ class Client implements Chat {
     }
   }
 
+  // pause waits to try a send again; a stop ends the wait, for the send's loop to end it.
   private async pause_(code: string, ms: number, signal: AbortSignal): Promise<void> {
     live(signal);
     this.set_({ waiting: { code, until: Date.now() + ms } });
+    const wake = new AbortController();
+    const end = () => wake.abort();
+    signal.addEventListener("abort", end, { once: true });
+    this.wake_ = end;
     try {
-      await sleep(ms, signal);
+      await sleep(ms, wake.signal);
+    } catch (e) {
+      if (signal.aborted) throw e;
     } finally {
+      signal.removeEventListener("abort", end);
+      if (this.wake_ === end) this.wake_ = null;
       if (!signal.aborted) this.set_({ waiting: null });
     }
+  }
+
+  private stopping_(): boolean {
+    return this.stopped_ !== null && this.stopped_ === this.sending_;
+  }
+
+  // named notes the conversation the send's stream answers in, and asks the chat to stop
+  // its answer when the user already did.
+  private named_(id: string): void {
+    if (!this.sending_) return;
+    this.streaming_ = id;
+    if (this.stopping_() && this.stopAsked_ !== this.sending_) void this.askStop_(id);
+  }
+
+  // askStop asks the chat to stop the answer being written in conversation id; the
+  // answer's stream, or the conversation followed, then says how it ended.
+  private askStop_(id: string): Promise<StopResult> {
+    this.stopAsked_ = this.sending_;
+    return this.flow_(null, async (signal): Promise<StopResult> => {
+      discard(await this.retried_({ method: "POST", path: "/conversations/" + encodeURIComponent(id) + "/stop" }, signal));
+      return { ok: true };
+    });
   }
 
   // ifLanded settles a request whose outcome is unknown, a lost connection or a
@@ -1109,6 +1165,7 @@ class Client implements Chat {
   private async read_(res: Response, stream: AbortController, signal: AbortSignal, sent: Sent, u: Unnamed | null): Promise<Reply> {
     let conversation = sent.target_;
     let message = false;
+    if (conversation !== null) this.named_(conversation);
     const reader = res.body ? res.body.getReader() : null;
     if (reader) {
       const decoder = new TextDecoder();
@@ -1144,6 +1201,7 @@ class Client implements Chat {
               if (!("conversation" in out)) return out;
               conversation = out.conversation;
               this.land_(u);
+              this.named_(conversation);
             }
           } finally {
             this.batching_ = false;
@@ -1218,8 +1276,12 @@ class Client implements Chat {
         return null;
       }
       case "done": {
-        const m = messageOf(o.message);
         const stop = typeof o.stop === "string" ? (o.stop as Stop) : null;
+        if (o.message == null && stop === "stopped") {
+          this.set_({ outgoing: null, answer: null, answering: false, waiting: null, stop });
+          throw halted();
+        }
+        const m = messageOf(o.message);
         this.seen_([m]);
         this.set_({ messages: withMessage(this.state_.messages, m), outgoing: null, answer: null, answering: false, waiting: null, stop });
         return { message: m, stop };
@@ -1245,6 +1307,7 @@ class Client implements Chat {
       this.unsure_ = sent;
       throw new ChatError("no_answer", "The answer was lost.");
     }
+    this.named_(cid);
     const version = this.convVersion_;
     let v: View;
     try {
@@ -1263,7 +1326,7 @@ class Client implements Chat {
       while (i >= 0 && !isSent(v.messages[i], sent)) i--;
       reply = i >= 0 ? v.messages.slice(i + 1).find((m) => m.role === "assistant") : undefined;
     }
-    if (!reply) throw new ChatError("no_answer", "The assistant didn't answer.");
+    if (!reply) throw this.stopping_() ? halted() : new ChatError("no_answer", "The assistant didn't answer.");
     return { message: reply, stop: null };
   }
 
@@ -1358,6 +1421,12 @@ function waitFor(err: ChatError): number | null {
 
 function busy(): ChatError {
   return new ChatError("busy", "Still answering.");
+}
+
+// halted: stopped with no answer to keep, before the assistant wrote anything, or
+// before the chat took the message, which then stays in outgoing.
+function halted(): ChatError {
+  return new ChatError("stopped", "Stopped.");
 }
 
 function listOff(): ChatError {
@@ -1548,6 +1617,7 @@ function messageOf(v: unknown): Message {
   }
   if (Array.isArray(o.files)) m.files = o.files.filter((f) => f && typeof f.id === "string").map(fileOf);
   if (Array.isArray(o.actions)) m.actions = actionsOf(o.actions);
+  if (o.stop) m.stop = String(o.stop);
   return m;
 }
 

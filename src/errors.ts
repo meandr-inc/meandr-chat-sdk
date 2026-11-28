@@ -28,6 +28,7 @@ export type ChatErrorCode =
   | "no_answer"
   | "network"
   | "aborted"
+  | "stopped"
   | "bad_request"
   | "internal"
   | "protocol";

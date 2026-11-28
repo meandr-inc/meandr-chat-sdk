@@ -30,6 +30,7 @@ export type {
   SendOptions,
   SendResult,
   Stop,
+  StopResult,
   TokenRequest,
   TokenSource,
   ToolProgress,
