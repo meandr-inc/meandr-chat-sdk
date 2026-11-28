@@ -66,7 +66,7 @@ export interface FileLimits {
 }
 
 // Open string unions: v1 may add values, which the client passes through.
-export type Stop = "end" | "max_tokens" | "refusal" | "paused" | (string & {});
+export type Stop = "end" | "max_tokens" | "refusal" | "paused" | "stopped" | (string & {});
 export type ToolStatus = "started" | "done" | "failed" | "waiting" | (string & {});
 
 export interface ToolProgress {
@@ -117,6 +117,8 @@ export type OpenConversationResult = { ok: true; conversation: Conversation } | 
 export type DeleteConversationResult = { ok: true } | { ok: false; error: ChatError };
 
 export type RespondResult = { ok: true } | { ok: false; error: ChatError };
+
+export type StopResult = { ok: true } | { ok: false; error: ChatError };
 
 export type LoadOlderResult = { ok: true; messages: Message[] } | { ok: false; error: ChatError };
 
@@ -178,6 +180,11 @@ export interface Chat {
   readFile(file: ChatFile | string, options?: ReadFileOptions): Promise<ReadFileResult>;
   /** Has the assistant speak first, as the chat's start instructions say: the page can't supply them. */
   start(): Promise<SendResult>;
+  /**
+   * Stops the answer being written in the conversation shown, which keeps what it wrote: its send or start
+   * resolves with stop "stopped", or with the error stopped when there is no answer to keep.
+   */
+  stop(): Promise<StopResult>;
   /** Ends the conversation shown and forgets it at once; before the session opens, the one it opens on. Never rejects. */
   endConversation(): Promise<void>;
   /** Ends the conversation shown, as endConversation does: the next message or start begins a new one. */

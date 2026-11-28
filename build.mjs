@@ -11,9 +11,9 @@ const mangleProps = /_$/;
 
 // What a page ships, minified and gzipped, in bytes; the build fails past these.
 const budgets = {
-  "src/index.ts": 12600,
+  "src/index.ts": 12800,
   "src/markdown.ts": 6700,
-  "src/global.ts": 19200,
+  "src/global.ts": 19400,
 };
 
 rmSync("dist", { recursive: true, force: true });
